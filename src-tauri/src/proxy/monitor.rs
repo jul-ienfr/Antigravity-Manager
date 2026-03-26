@@ -23,6 +23,8 @@ pub struct ProxyRequestLog {
     pub output_tokens: Option<u32>,
     pub protocol: Option<String>,     // 协议类型: "openai", "anthropic", "gemini"
     pub username: Option<String>,     // User token username
+    pub user_agent: Option<String>,   // User-Agent (Application)
+    pub queue_duration: Option<u64>,  // ms spent in token_manager queue
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -37,6 +39,7 @@ pub struct ProxyMonitor {
     pub stats: RwLock<ProxyStats>,
     pub max_logs: usize,
     pub enabled: AtomicBool,
+    pub active_requests: RwLock<std::collections::HashMap<String, ProxyRequestLog>>,
     app_handle: Option<tauri::AppHandle>,
 }
 
@@ -66,8 +69,27 @@ impl ProxyMonitor {
             stats: RwLock::new(ProxyStats::default()),
             max_logs,
             enabled: AtomicBool::new(false), // Default to disabled
+            active_requests: RwLock::new(std::collections::HashMap::new()),
             app_handle,
         }
+    }
+
+    pub async fn add_active_request(&self, log: ProxyRequestLog) {
+        if !self.is_enabled() {
+            return;
+        }
+        let mut active = self.active_requests.write().await;
+        active.insert(log.id.clone(), log.clone());
+        
+        // Emit event to update pending request in UI immediately
+        if let Some(app) = &self.app_handle {
+            let _ = app.emit("proxy://request_pending", &log);
+        }
+    }
+
+    pub async fn remove_active_request(&self, id: &str) -> Option<ProxyRequestLog> {
+        let mut active = self.active_requests.write().await;
+        active.remove(id)
     }
 
     pub fn set_enabled(&self, enabled: bool) {
@@ -79,18 +101,14 @@ impl ProxyMonitor {
     }
 
     pub async fn log_request(&self, log: ProxyRequestLog) {
+        // [NEW] Record RPM/TPM in fast lock-free tracker
         if let (Some(account), Some(input), Some(output)) = (
             &log.account_email,
             log.input_tokens,
             log.output_tokens,
         ) {
-            let model = log.model.clone().unwrap_or_else(|| "unknown".to_string());
-            let account = account.clone();
-            tokio::spawn(async move {
-                if let Err(e) = crate::modules::token_stats::record_usage(&account, &model, input, output) {
-                    tracing::debug!("Failed to record token stats: {}", e);
-                }
-            });
+            let total_tokens = input + output;
+            crate::proxy::usage_tracker::USAGE_TRACKER.record_usage(account, total_tokens);
         }
 
         if !self.is_enabled() {
@@ -179,6 +197,8 @@ impl ProxyMonitor {
                 output_tokens: log.output_tokens,
                 protocol: log.protocol.clone(),
                 username: log.username.clone(),
+                user_agent: log.user_agent.clone(),
+                queue_duration: log.queue_duration,
             };
             let _ = app.emit("proxy://request", &log_summary);
         }

@@ -409,9 +409,14 @@ pub fn get_sync_status(app: &CliApp, proxy_url: &str) -> (bool, bool, Option<Str
                 if file.name == "settings.json" {
                     let json: Value = serde_json::from_str(&content).unwrap_or_default();
                     let url = json.get("env").and_then(|e| e.get("ANTHROPIC_BASE_URL")).and_then(|v| v.as_str());
+                    let has_auth_token = json.get("env").and_then(|e| e.get("ANTHROPIC_AUTH_TOKEN")).is_some();
+                    let has_overrides = json.get("modelOverrides").is_some();
+                    
                     if let Some(u) = url {
                         current_base_url = Some(u.to_string());
-                        if u.trim_end_matches('/') != proxy_url.trim_end_matches('/') {
+                        // On considère que l'app est synchro si l'URL pointe vers le proxy
+                        // ET qu'on a bien mis en place notre architecture (Auth Token + Overrides)
+                        if u.trim_end_matches('/') != proxy_url.trim_end_matches('/') || !has_auth_token || !has_overrides {
                             all_synced = false;
                         }
                     } else {
@@ -720,4 +725,237 @@ pub async fn get_cli_config_content(app_type: CliApp, file_name: Option<String>)
         return Err("配置文件不存在".to_string());
     }
     fs::read_to_string(&file.path).map_err(|e| format!("读取配置文件失败: {}", e))
+}
+
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct ClaudeSyncModels {
+    pub sonnet: String,
+    pub opus: String,
+    pub haiku: String,
+    pub custom: String,
+}
+
+#[tauri::command]
+pub async fn execute_claude_restore_advanced() -> Result<(), String> {
+    // Target A: ~/.claude/settings.json
+    let app_type = CliApp::Claude;
+    let files = app_type.config_files();
+    for file in &files {
+        if file.name == "settings.json" && file.path.exists() {
+            let file_content = fs::read_to_string(&file.path).unwrap_or_else(|_| "{}".to_string());
+            if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&file_content) {
+                if let Some(obj) = json.as_object_mut() {
+                    if let Some(env) = obj.get_mut("env").and_then(|e| e.as_object_mut()) {
+                        env.remove("ANTHROPIC_BASE_URL");
+                        env.remove("ANTHROPIC_AUTH_TOKEN");
+                        env.remove("ANTHROPIC_API_KEY");
+                    }
+                    obj.remove("modelOverrides");
+                    let _ = fs::write(&file.path, serde_json::to_string_pretty(&json).unwrap_or_default());
+                }
+            }
+        }
+    }
+
+    // Target B: IDE settings (VS Code & Antigravity)
+    let ide_folders = vec!["Code", "Antigravity", "VSCodium", "Cursor"];
+    if let Some(config_dir) = dirs::config_dir() {
+        for ide in ide_folders {
+            let settings_path = config_dir.join(ide).join("User").join("settings.json");
+            if settings_path.exists() {
+                let vscode_content = fs::read_to_string(&settings_path).unwrap_or_else(|_| "{}".to_string());
+                if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&vscode_content) {
+                    let mut modified = false;
+                    if let Some(obj) = json.as_object_mut() {
+                        obj.remove("claudeCode.disableLoginPrompt");
+                        obj.remove("claudeCode.allowDangerouslySkipPermissions");
+                        obj.remove("claudeCode.initialPermissionMode");
+                        obj.remove("claudeCode.selectedModel");
+
+                        // We don't remove the whole array, just filter out our custom env vars
+                        if let Some(env_vars) = obj.get_mut("claudeCode.environmentVariables").and_then(|e| e.as_array_mut()) {
+                            let original_len = env_vars.len();
+                            env_vars.retain(|var| {
+                                if let Some(v_obj) = var.as_object() {
+                                    if let Some(name) = v_obj.get("name").and_then(|n| n.as_str()) {
+                                        return name != "ANTHROPIC_CUSTOM_MODEL_OPTION" 
+                                            && name != "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"
+                                            && name != "ANTHROPIC_BASE_URL"
+                                            && name != "ANTHROPIC_AUTH_TOKEN"
+                                            && name != "ANTHROPIC_API_KEY";
+                                    }
+                                }
+                                true
+                            });
+                            if env_vars.is_empty() {
+                                obj.remove("claudeCode.environmentVariables");
+                            }
+                            modified = true;
+                        }
+                        
+                        if modified {
+                            let _ = fs::write(&settings_path, serde_json::to_string_pretty(&json).unwrap_or_default());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+#[tauri::command]
+pub async fn execute_claude_sync_advanced(proxy_url: String, api_key: String, models: ClaudeSyncModels) -> Result<(), String> {
+    let app_type = CliApp::Claude;
+    let files = app_type.config_files();
+    
+    // Target A: ~/.claude/settings.json (Le Cerveau)
+    for file in &files {
+        if file.name == "settings.json" {
+            if let Some(parent) = file.path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+
+            // Backup
+            if file.path.exists() {
+                let backup_path = file.path.with_file_name(format!("{}.antigravity.bak", file.name));
+                if !backup_path.exists() {
+                    let _ = fs::copy(&file.path, &backup_path);
+                }
+            }
+
+            let file_content = if file.path.exists() {
+                fs::read_to_string(&file.path).unwrap_or_else(|_| "{}".to_string())
+            } else {
+                "{}".to_string()
+            };
+
+            let mut json: serde_json::Value = serde_json::from_str(&file_content).unwrap_or_else(|_| serde_json::json!({}));
+            
+            // 1. Setup env network (Bypass OAuth via ANTHROPIC_AUTH_TOKEN)
+            let env = json.as_object_mut().unwrap().entry("env").or_insert(serde_json::json!({}));
+            if let Some(env_obj) = env.as_object_mut() {
+                env_obj.insert("ANTHROPIC_BASE_URL".to_string(), serde_json::Value::String(proxy_url.clone()));
+                if !api_key.is_empty() {
+                    env_obj.insert("ANTHROPIC_AUTH_TOKEN".to_string(), serde_json::Value::String(api_key.clone()));
+                    env_obj.remove("ANTHROPIC_API_KEY"); // Remove to avoid OAuth login screen
+                }
+            }
+
+            // 2. Setup modelOverrides (Silently routing native models to proxy models)
+            let overrides = json.as_object_mut().unwrap().entry("modelOverrides").or_insert(serde_json::json!({}));
+            if let Some(override_obj) = overrides.as_object_mut() {
+                if !models.sonnet.is_empty() {
+                    override_obj.insert("claude-3-5-sonnet-20241022".to_string(), serde_json::Value::String(models.sonnet.clone()));
+                    override_obj.insert("claude-sonnet-4-6".to_string(), serde_json::Value::String(models.sonnet.clone()));
+                }
+                if !models.opus.is_empty() {
+                    override_obj.insert("claude-3-opus-20240229".to_string(), serde_json::Value::String(models.opus.clone()));
+                    override_obj.insert("claude-opus-4-6".to_string(), serde_json::Value::String(models.opus.clone()));
+                }
+                if !models.haiku.is_empty() {
+                    override_obj.insert("claude-3-5-haiku-20241022".to_string(), serde_json::Value::String(models.haiku.clone()));
+                    override_obj.insert("claude-haiku-4-5".to_string(), serde_json::Value::String(models.haiku.clone()));
+                    override_obj.insert("claude-haiku-4-5-20251001".to_string(), serde_json::Value::String(models.haiku.clone()));
+                }
+            }
+
+            if let Err(e) = fs::write(&file.path, serde_json::to_string_pretty(&json).unwrap()) {
+                return Err(format!("Failed to write Claude config: {}", e));
+            }
+        }
+    }
+
+    // Target B: IDE settings (Le Maquillage / UI)
+    let ide_folders = vec!["Code", "Antigravity", "VSCodium", "Cursor"];
+    if let Some(config_dir) = dirs::config_dir() {
+        for ide in ide_folders {
+            let mut settings_path = config_dir.join(ide).join("User").join("settings.json");
+            
+            // Check for VS Code profiles folder
+            if !settings_path.exists() && ide == "Code" {
+                let profiles_dir = config_dir.join("Code").join("User").join("profiles");
+                if let Ok(entries) = fs::read_dir(profiles_dir) {
+                    for entry in entries.flatten() {
+                        let p = entry.path().join("settings.json");
+                        if p.exists() {
+                            settings_path = p;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if settings_path.exists() {
+                let vscode_content = fs::read_to_string(&settings_path).unwrap_or_else(|_| "{}".to_string());
+                if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&vscode_content) {
+                    if let Some(obj) = json.as_object_mut() {
+                        
+                        // Comfort UI options
+                        obj.insert("claudeCode.disableLoginPrompt".to_string(), serde_json::Value::Bool(true));
+                        obj.insert("claudeCode.allowDangerouslySkipPermissions".to_string(), serde_json::Value::Bool(true));
+                        obj.insert("claudeCode.initialPermissionMode".to_string(), serde_json::Value::String("bypassPermissions".to_string()));
+                        
+                        // Remove useTerminal to enforce Webview GUI
+                        obj.remove("claudeCode.useTerminal");
+
+                        // Environment variables MUST be an array of { name, value } objects
+                        // 1. Get existing vars or create a new array
+                        let mut env_vars = obj.get("claudeCode.environmentVariables")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_else(Vec::new);
+
+                        // 2. Remove our custom model vars if they exist (to avoid duplicates)
+                        env_vars.retain(|var| {
+                            if let Some(v_obj) = var.as_object() {
+                                if let Some(name) = v_obj.get("name").and_then(|n| n.as_str()) {
+                                    return name != "ANTHROPIC_CUSTOM_MODEL_OPTION" 
+                                        && name != "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME";
+                                }
+                            }
+                            true
+                        });
+                        
+                        // 3. Add the custom model vars if a custom model was selected
+                        if !models.custom.is_empty() {
+                            let custom_name = models.custom.clone();
+                            // Optional: Prettify the custom name for the UI
+                            let pretty_name = custom_name
+                                .replace("-", " ")
+                                .split_whitespace()
+                                .map(|word| {
+                                    let mut c = word.chars();
+                                    match c.next() {
+                                        None => String::new(),
+                                        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                                    }
+                                })
+                                .collect::<Vec<String>>()
+                                .join(" ");
+                                
+                            env_vars.push(serde_json::json!({
+                                "name": "ANTHROPIC_CUSTOM_MODEL_OPTION",
+                                "value": models.custom.clone()
+                            }));
+                            env_vars.push(serde_json::json!({
+                                "name": "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME",
+                                "value": pretty_name
+                            }));
+                        }
+                        
+                        // 4. Update the object (only if we have vars, or if it already existed to empty it properly)
+                        if !env_vars.is_empty() || obj.contains_key("claudeCode.environmentVariables") {
+                            obj.insert("claudeCode.environmentVariables".to_string(), serde_json::Value::Array(env_vars));
+                        }
+                        
+                        let _ = fs::write(&settings_path, serde_json::to_string_pretty(&json).unwrap_or_default());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }

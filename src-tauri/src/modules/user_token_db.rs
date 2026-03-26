@@ -165,7 +165,7 @@ pub fn create_token(
 ) -> Result<UserToken, String> {
     let conn = connect_db()?;
     let id = Uuid::new_v4().to_string();
-    let token = format!("sk-{}", Uuid::new_v4().to_string().replace("-", ""));
+    let token = format!("sk-ant-api03-{}", Uuid::new_v4().to_string().replace("-", ""));
     let now = Utc::now().timestamp();
 
     let expires_at = match expires_type.as_str() {

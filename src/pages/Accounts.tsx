@@ -40,7 +40,9 @@ function Accounts() {
   const {
     accounts,
     currentAccount,
+    rateLimitStatus,
     fetchAccounts,
+    fetchRateLimitStatus,
     addAccount,
     deleteAccount,
     deleteAccounts,
@@ -226,6 +228,11 @@ function Accounts() {
 
   useEffect(() => {
     fetchAccounts();
+    fetchRateLimitStatus();
+    const interval = setInterval(() => {
+      fetchRateLimitStatus();
+    }, 3000);
+    return () => clearInterval(interval);
   }, []);
 
   // Reset pagination when view mode changes to avoid empty pages or confusion
@@ -1077,6 +1084,7 @@ function Accounts() {
                 onWarmup={handleWarmup}
                 onUpdateLabel={handleUpdateLabel}
                 onViewError={(id: string) => setErrorAccountId(id)}
+                rateLimitStatus={rateLimitStatus}
               />
             </div>
           </div>
@@ -1104,6 +1112,7 @@ function Accounts() {
               onWarmup={handleWarmup}
               onUpdateLabel={handleUpdateLabel}
               onViewError={(id: string) => setErrorAccountId(id)}
+              rateLimitStatus={rateLimitStatus}
             />
           </div>
         )}

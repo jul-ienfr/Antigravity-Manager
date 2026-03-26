@@ -529,6 +529,13 @@ pub async fn handle_messages(
     let mut last_mapped_model: Option<String> = None;
     let mut last_status = StatusCode::SERVICE_UNAVAILABLE; // Default to 503 if no response reached
     
+    // [FIX 429-RACE] Track accounts that returned 429/503 on THIS request.
+    // Passed to get_token_excluding so they are filtered out IMMEDIATELY, before
+    // mark_rate_limited_async has finished propagating through the async rate-limit tracker.
+    let mut excluded_accounts: std::collections::HashSet<String> = std::collections::HashSet::new();
+    
+    let mut accumulated_queue_duration: u64 = 0;
+    
     for attempt in 0..max_attempts {
         // 2. 模型路由解析
         let mut mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
@@ -558,30 +565,49 @@ pub async fn handle_messages(
         let session_id = Some(session_id_str.as_str());
 
         let force_rotate_token = attempt > 0;
-        let (access_token, project_id, email, account_id, _wait_ms) = match token_manager.get_token(&config.request_type, force_rotate_token, session_id, &config.final_model).await {
+        let queue_start = std::time::Instant::now();
+        let (access_token, project_id, email, account_id, _wait_ms) = match token_manager.get_token_excluding(&config.request_type, force_rotate_token, session_id, &config.final_model, Some(&excluded_accounts)).await {
             Ok(t) => t,
             Err(e) => {
                 let safe_message = if e.contains("invalid_grant") {
                     "OAuth refresh failed (invalid_grant): refresh_token likely revoked/expired; reauthorize account(s) to restore service.".to_string()
                 } else {
-                    e
+                    e.clone()
                 };
                 let headers = [
                     ("X-Mapped-Model", mapped_model.as_str()),
                 ];
-                 return (
-                    StatusCode::SERVICE_UNAVAILABLE,
+
+                let e_lower = e.to_lowercase();
+                if e_lower.contains("invalid_grant") || e_lower.contains("unauthorized") {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        headers,
+                        Json(json!({
+                            "type": "error",
+                            "error": {
+                                "type": "authentication_error",
+                                "message": format!("Token error: {}", safe_message)
+                            }
+                        }))
+                    ).into_response();
+                }
+
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
                     headers,
                     Json(json!({
                         "type": "error",
                         "error": {
-                            "type": "overloaded_error",
-                            "message": format!("No available accounts: {}", safe_message)
+                            "type": "rate_limit_error",
+                            "message": format!("Rate limited (proxy pool exhaustion): {}", safe_message)
                         }
                     }))
                 ).into_response();
             }
         };
+
+        accumulated_queue_duration += queue_start.elapsed().as_millis() as u64;
 
         last_email = Some(email.clone());
         info!("✓ Using account: {} (type: {})", email, config.request_type);
@@ -796,7 +822,7 @@ pub async fn handle_messages(
         // let _trace_id = format!("req_{}", chrono::Utc::now().timestamp_subsec_millis());
 
         let token_obj = token_manager.get_token_by_id(&account_id);
-        let gemini_body = match transform_claude_request_in(&request_with_mapped, &project_id, retried_without_thinking, Some(account_id.as_str()), &session_id_str, token_obj.as_ref()) {
+        let mut gemini_body = match transform_claude_request_in(&request_with_mapped, &project_id, retried_without_thinking, Some(account_id.as_str()), &session_id_str, token_obj.as_ref()) {
             Ok(b) => {
                 debug!("[{}] Transformed Gemini Body: {}", trace_id, serde_json::to_string_pretty(&b).unwrap_or_default());
                 b
@@ -819,6 +845,65 @@ pub async fn handle_messages(
                 ).into_response();
             }
         };
+
+        // [REQUEST SPLITTING START]
+        let has_custom_tools = request_with_mapped.tools.as_ref().map_or(false, |t| !t.is_empty());
+        if has_custom_tools && config.inject_google_search {
+            tracing::info!("[{}] 🛡️ Request Splitting: Executing pre-flight Google Search because custom tools are present", trace_id);
+            
+            let mut preflight_body = gemini_body.clone();
+            if let Some(req_obj) = preflight_body.get_mut("request").and_then(|r| r.as_object_mut()) {
+                req_obj.insert("tools".to_string(), json!([{"googleSearch": {}}]));
+                req_obj.remove("toolConfig");
+            }
+            
+            let preflight_call = upstream.call_v1_internal_with_headers(
+                "generateContent",
+                &access_token,
+                preflight_body,
+                None, // query_string
+                std::collections::HashMap::new(), // extra_headers
+                Some(account_id.as_str())
+            ).await;
+
+            if let Ok(result) = preflight_call {
+                if let Ok(resp_json) = result.response.json::<Value>().await {
+                    let preflight_openai = crate::proxy::mappers::openai::response::transform_openai_response(&resp_json, None, 0);
+                    let mut extracted_text = String::new();
+                    if let Some(choice) = preflight_openai.choices.first() {
+                        if let Some(crate::proxy::mappers::openai::OpenAIContent::String(ref s)) = choice.message.content {
+                            extracted_text = s.clone();
+                        }
+                    }
+
+                    if !extracted_text.is_empty() {
+                        tracing::info!("[{}] 🛡️ Pre-flight search successful. Injecting context.", trace_id);
+                        if let Some(last_msg) = request_with_mapped.messages.last_mut() {
+                            let injection = format!("\n\n[Web Search Context]\n{}", extracted_text);
+                            use crate::proxy::mappers::claude::models::{MessageContent, ContentBlock};
+                            match &mut last_msg.content {
+                                MessageContent::String(s) => {
+                                    s.push_str(&injection);
+                                }
+                                MessageContent::Array(arr) => {
+                                    arr.push(ContentBlock::Text {
+                                        text: injection,
+                                    });
+                                }
+                            }
+                        }
+                        
+                        // Re-transform the mutated request
+                        if let Ok(new_body) = transform_claude_request_in(&request_with_mapped, &project_id, retried_without_thinking, Some(account_id.as_str()), &session_id_str, token_obj.as_ref()) {
+                            gemini_body = new_body;
+                        }
+                    }
+                }
+            } else {
+                tracing::warn!("[{}] 🛡️ Pre-flight search failed. Continuing without web context.", trace_id);
+            }
+        }
+        // [REQUEST SPLITTING END]
 
         if debug_logger::is_enabled(&debug_cfg) {
             let payload = json!({
@@ -849,7 +934,9 @@ pub async fn handle_messages(
         // [FIX #765/1522] Prepare Robust Beta Headers for Claude models
         let mut extra_headers = std::collections::HashMap::new();
         if mapped_model.to_lowercase().contains("claude") {
-            extra_headers.insert("anthropic-beta".to_string(), "claude-code-20250219".to_string());
+            let client_beta = headers.get("anthropic-beta").and_then(|v| v.to_str().ok());
+            let sanitized = crate::proxy::common::utils::sanitize_anthropic_beta(client_beta);
+            extra_headers.insert("anthropic-beta".to_string(), sanitized);
             tracing::debug!("[{}] Added Comprehensive Beta Headers for Claude model", trace_id);
         }
         
@@ -860,8 +947,15 @@ pub async fn handle_messages(
             for (k, v) in temp_headers {
                 if let Some(name) = k {
                     if let Ok(v_str) = v.to_str() {
-                        extra_headers.insert(name.to_string(), v_str.to_string());
-                        tracing::debug!("[{}] Added Adapter Header: {}: {}", trace_id, name, v_str);
+                        let final_v_str = if name.as_str().to_lowercase() == "anthropic-beta" {
+                            let existing = extra_headers.get("anthropic-beta").map(|s| s.as_str());
+                            let combined = format!("{},{}", existing.unwrap_or(""), v_str);
+                            crate::proxy::common::utils::sanitize_anthropic_beta(Some(&combined))
+                        } else {
+                            v_str.to_string()
+                        };
+                        extra_headers.insert(name.to_string(), final_v_str.clone());
+                        tracing::debug!("[{}] Added Adapter Header: {}: {}", trace_id, name, final_v_str);
                     }
                 }
             }
@@ -903,10 +997,10 @@ pub async fn handle_messages(
         }
 
         let response = call_result.response;
-        // [NEW] 提取实际请求的上游端点 URL，用于日志记录和排查
         let upstream_url = response.url().to_string();
         let status = response.status();
-        last_status = status;
+        last_status = status; // [FIX] Update last_status so exhaustion loop returns actual status!
+        let status_code = status.as_u16();
         
         // 成功
         if status.is_success() {
@@ -938,11 +1032,15 @@ pub async fn handle_messages(
 
                 let current_message_count = request_with_mapped.messages.len();
 
-                // [FIX #MCP] Extract registered tool names for MCP fuzzy matching
-                let registered_tool_names: Vec<String> = request_with_mapped.tools
-                    .as_ref()
-                    .map(|tools| tools.iter().filter_map(|t| t.name.clone()).collect())
-                    .unwrap_or_default();
+                // [NEW] Extract tool schemas for dynamic validation
+                let mut tool_schemas: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
+                if let Some(tools) = &request_with_mapped.tools {
+                    for tool in tools {
+                        if let (Some(name), Some(schema)) = (&tool.name, &tool.input_schema) {
+                            tool_schemas.insert(name.clone(), schema.clone());
+                        }
+                    }
+                }
 
                 // [FIX #530/#529/#859] Enhanced Peek logic to handle heartbeats and slow start
                 // We must pre-read until we find a MEANINGFUL content block (like message_start).
@@ -957,7 +1055,7 @@ pub async fn handle_messages(
                     Some(raw_estimated), // [FIX] Pass estimated tokens for calibrator learning
                     current_message_count, // [NEW v4.0.0] Pass message count for rewind detection
                     client_adapter.clone(), // [NEW] Pass client adapter
-                    registered_tool_names, // [FIX #MCP] Pass tool names for fuzzy matching
+                    tool_schemas, // [NEW] Pass tool schemas for dynamic validation
                 );
 
                 let mut first_data_chunk = None;
@@ -1022,7 +1120,7 @@ pub async fn handle_messages(
                         // 判断客户端期望的格式
                         if client_wants_stream {
                             // 客户端本就要 Stream，直接返回 SSE
-                            return Response::builder()
+                            let mut resp = Response::builder()
                                 .status(StatusCode::OK)
                                 .header(header::CONTENT_TYPE, "text/event-stream")
                                 .header(header::CACHE_CONTROL, "no-cache")
@@ -1033,6 +1131,8 @@ pub async fn handle_messages(
                                 .header("X-Context-Purified", if is_purified { "true" } else { "false" })
                                 .body(Body::from_stream(combined_stream))
                                 .unwrap();
+                            resp.extensions_mut().insert(crate::proxy::middleware::monitor::QueueDuration(accumulated_queue_duration));
+                            return resp;
                         } else {
                             // 客户端要非 Stream，需要收集完整响应并转换为 JSON
                             use crate::proxy::mappers::claude::collect_stream_to_json;
@@ -1040,7 +1140,7 @@ pub async fn handle_messages(
                             match collect_stream_to_json(combined_stream).await {
                                 Ok(full_response) => {
                                     info!("[{}] ✓ Stream collected and converted to JSON", trace_id);
-                                    return Response::builder()
+                                    let mut resp = Response::builder()
                                         .status(StatusCode::OK)
                                         .header(header::CONTENT_TYPE, "application/json")
                                         .header("X-Account-Email", &email)
@@ -1048,6 +1148,8 @@ pub async fn handle_messages(
                                         .header("X-Context-Purified", if is_purified { "true" } else { "false" })
                                         .body(Body::from(serde_json::to_string(&full_response).unwrap()))
                                         .unwrap();
+                                    resp.extensions_mut().insert(crate::proxy::middleware::monitor::QueueDuration(accumulated_queue_duration));
+                                    return resp;
                                 }
                                 Err(e) => {
                                     return (StatusCode::INTERNAL_SERVER_ERROR, format!("Stream collection error: {}", e)).into_response();
@@ -1123,7 +1225,9 @@ pub async fn handle_messages(
                     cache_info
                 );
 
-                return (StatusCode::OK, [("X-Account-Email", email.as_str()), ("X-Mapped-Model", request_with_mapped.model.as_str())], Json(claude_response)).into_response();
+                let mut resp = (StatusCode::OK, [("X-Account-Email", email.as_str()), ("X-Mapped-Model", request_with_mapped.model.as_str())], Json(claude_response)).into_response();
+                resp.extensions_mut().insert(crate::proxy::middleware::monitor::QueueDuration(accumulated_queue_duration));
+                return resp;
             }
         }
         
@@ -1157,6 +1261,9 @@ pub async fn handle_messages(
         // 🆕 传入实际使用的模型,实现模型级别限流,避免不同模型配额互相影响
         if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 || status_code == 404 {
             token_manager.mark_rate_limited_async(&email, status_code, retry_after.as_deref(), &error_text, Some(&request_with_mapped.model)).await;
+            // [FIX 429-RACE] Immediately add this account to the local exclusion set so the
+            // next get_token_excluding call never picks it again, regardless of async propagation.
+            excluded_accounts.insert(account_id.clone());
         }
 
         // 4. 处理 400 错误 (Thinking 签名失效 或 块顺序错误)

@@ -99,6 +99,31 @@ pub fn update_global_system_prompt_config(config: GlobalSystemPromptConfig) {
 // ============================================================================
 static GLOBAL_IMAGE_THINKING_MODE: OnceLock<RwLock<String>> = OnceLock::new();
 
+// ============================================================================
+// 全局 Hacker Config 存储
+// ============================================================================
+static GLOBAL_HACKER_CONFIG: OnceLock<RwLock<HackerConfig>> = OnceLock::new();
+
+pub fn get_hacker_config() -> HackerConfig {
+    GLOBAL_HACKER_CONFIG
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .map(|cfg| cfg.clone())
+        .unwrap_or_default()
+}
+
+pub fn update_hacker_config(config: HackerConfig) {
+    if let Some(lock) = GLOBAL_HACKER_CONFIG.get() {
+        if let Ok(mut cfg) = lock.write() {
+            *cfg = config.clone();
+            tracing::info!("[Hacker-Config] Global config updated.");
+        }
+    } else {
+        let _ = GLOBAL_HACKER_CONFIG.set(RwLock::new(config.clone()));
+        tracing::info!("[Hacker-Config] Global config initialized.");
+    }
+}
+
 pub fn get_image_thinking_mode() -> String {
     GLOBAL_IMAGE_THINKING_MODE
         .get()
@@ -454,6 +479,168 @@ impl Default for SecurityMonitorConfig {
     }
 }
 
+/// Configuration Hacker / Red Team (Fonctionnalités avancées de manipulation)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HackerConfig {
+    /// Furtivité Avancée (Anti-Tracker / Anonymization)
+    #[serde(default)]
+    pub enable_advanced_stealth: bool,
+    /// Amnésie (Supprime les instructions système)
+    #[serde(default)]
+    pub enable_amnesia: bool,
+    /// God Mode (Force un rôle agressif de type Jailbreak)
+    #[serde(default)]
+    pub enable_god_mode: bool,
+    /// Time Travel (Spoofing de la date)
+    #[serde(default)]
+    pub enable_time_travel: bool,
+    /// Shadow Ban Bypass (Détecteur de censure actif et auto-retry)
+    #[serde(default)]
+    pub enable_shadow_ban_bypass: bool,
+    /// Anti Censeur (Manipulation des filtres sur le payload)
+    #[serde(default)]
+    pub enable_anti_censor: bool,
+    /// Auto Retry intelligent pour cacher les erreurs 500 à l'éditeur
+    #[serde(default)]
+    pub enable_auto_retry: bool,
+    /// Injection du port CDP 9000 pour l'extension Auto Accept
+    #[serde(default)]
+    pub enable_auto_accept: bool,
+    /// Installation automatique du Hook (Wrapper) au démarrage du Manager
+    #[serde(default)]
+    pub enable_auto_hook: bool,
+    /// Ajout automatique des comptes capturés (ya29) à la DB
+    #[serde(default = "default_true")]
+    pub enable_auto_harvest: bool,
+    /// Force une acceptation par un faux message assistant via Context Inception
+    #[serde(default)]
+    pub enable_context_inception: bool,
+}
+
+impl Default for HackerConfig {
+    fn default() -> Self {
+        Self {
+            enable_advanced_stealth: false,
+            enable_amnesia: false,
+            enable_god_mode: false,
+            enable_time_travel: false,
+            enable_shadow_ban_bypass: false,
+            enable_anti_censor: false,
+            enable_auto_retry: true, // Activé par défaut selon la demande
+            enable_auto_accept: false,
+            enable_auto_hook: false,
+            enable_auto_harvest: true,
+            enable_context_inception: false,
+        }
+    }
+}
+
+// ============================================================================
+// Distribution Prédictive (Anti-429) 配置
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictiveQueueMode {
+    Queue,
+    Reject,
+}
+
+impl Default for PredictiveQueueMode {
+    fn default() -> Self {
+        Self::Queue
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TierLimitMode {
+    Auto,
+    Manual,
+}
+
+impl Default for TierLimitMode {
+    fn default() -> Self {
+        TierLimitMode::Auto
+    }
+}
+
+fn default_rpm_tier() -> u32 { 14 }
+fn default_tpm_tier() -> u32 { 30000 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TierLimitConfig {
+    #[serde(default)]
+    pub mode: TierLimitMode,
+    #[serde(default = "default_rpm_tier")]
+    pub rpm_limit: u32,
+    #[serde(default = "default_tpm_tier")]
+    pub tpm_limit: u32,
+}
+
+impl Default for TierLimitConfig {
+    fn default() -> Self {
+        Self {
+            mode: TierLimitMode::Auto,
+            rpm_limit: default_rpm_tier(),
+            tpm_limit: default_tpm_tier(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PredictiveDistributionConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    
+    #[serde(default)]
+    pub mode: PredictiveQueueMode,
+
+    #[serde(default = "default_tpm_limit")]
+    pub tpm_limit: u32, // Legacy fallback
+
+    #[serde(default = "default_rpm_limit")]
+    pub rpm_limit: u32, // Legacy fallback
+    
+    #[serde(default)]
+    pub free_tier: TierLimitConfig,
+    
+    #[serde(default)]
+    pub pro_tier: TierLimitConfig,
+    
+    #[serde(default)]
+    pub ultra_tier: TierLimitConfig,
+}
+
+impl Default for PredictiveDistributionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: PredictiveQueueMode::Queue,
+            tpm_limit: default_tpm_limit(),
+            rpm_limit: default_rpm_limit(),
+            free_tier: TierLimitConfig {
+                mode: TierLimitMode::Manual,
+                rpm_limit: default_rpm_limit(),
+                tpm_limit: default_tpm_limit(),
+            },
+            pro_tier: TierLimitConfig {
+                mode: TierLimitMode::Auto,
+                rpm_limit: 360,
+                tpm_limit: 2000000,
+            },
+            ultra_tier: TierLimitConfig {
+                mode: TierLimitMode::Auto,
+                rpm_limit: 1000,
+                tpm_limit: 8000000,
+            },
+        }
+    }
+}
+
+fn default_tpm_limit() -> u32 { 30000 }
+fn default_rpm_limit() -> u32 { 14 }
+
 /// 反代服务配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
@@ -526,6 +713,10 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub security_monitor: SecurityMonitorConfig,
 
+    /// Configuration de la distribution prédictive (Anti-429)
+    #[serde(default)]
+    pub predictive_limits: PredictiveDistributionConfig,
+
     /// 固定账号模式的账号ID (Fixed Account Mode)
     /// - None: 使用轮询模式
     /// - Some(account_id): 固定使用指定账号
@@ -555,6 +746,10 @@ pub struct ProxyConfig {
     /// 代理池配置
     #[serde(default)]
     pub proxy_pool: ProxyPoolConfig,
+
+    /// Hacker / Red Team Configuration
+    #[serde(default)]
+    pub hacker: HackerConfig,
 }
 
 /// 上游代理配置
@@ -573,7 +768,7 @@ impl Default for ProxyConfig {
             allow_lan_access: false, // 默认仅本机访问，隐私优先
             auth_mode: ProxyAuthMode::default(),
             port: 8045,
-            api_key: format!("sk-{}", uuid::Uuid::new_v4().simple()),
+            api_key: format!("sk-ant-api03-{}", uuid::Uuid::new_v4().simple()),
             admin_password: None,
             auto_start: false,
             custom_mapping: std::collections::HashMap::new(),
@@ -585,6 +780,7 @@ impl Default for ProxyConfig {
             scheduling: crate::proxy::sticky_config::StickySessionConfig::default(),
             experimental: ExperimentalConfig::default(),
             security_monitor: SecurityMonitorConfig::default(),
+            predictive_limits: PredictiveDistributionConfig::default(),
             preferred_account_id: None, // 默认使用轮询模式
             user_agent_override: None,
             saved_user_agent: None,
@@ -592,6 +788,7 @@ impl Default for ProxyConfig {
             global_system_prompt: GlobalSystemPromptConfig::default(),
             proxy_pool: ProxyPoolConfig::default(),
             image_thinking_mode: None,
+            hacker: HackerConfig::default(),
         }
     }
 }
@@ -655,6 +852,10 @@ pub struct ProxyEntry {
     pub last_check_time: Option<i64>,     // 上次检查时间
     pub is_healthy: bool,                 // 健康状态
     pub latency: Option<u64>,             // 延迟 (毫秒) [NEW]
+    #[serde(default)]
+    pub timezone: Option<String>,         // Auto-detected Timezone (e.g., "Europe/Paris")
+    #[serde(default)]
+    pub locale: Option<String>,           // Auto-detected Locale (e.g., "fr-FR")
 }
 
 /// 代理池配置

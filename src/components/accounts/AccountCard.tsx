@@ -24,6 +24,7 @@ interface AccountCardProps {
     onWarmup?: () => void;
     onUpdateLabel?: (label: string) => void;
     onViewError: () => void;
+    rateLimitStatus?: import('../../types/account').RateLimitStatus | null;
 }
 
 // 使用统一的模型配置
@@ -34,7 +35,7 @@ const DEFAULT_MODELS = Object.entries(MODEL_CONFIG).map(([id, config]) => ({
     Icon: config.Icon
 }));
 
-function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onWarmup, onUpdateLabel, onViewError }: AccountCardProps) {
+function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onWarmup, onUpdateLabel, onViewError, rateLimitStatus }: AccountCardProps) {
     const { t } = useTranslation();
     const { config, showAllQuotas } = useConfigStore();
     const isDisabled = Boolean(account.disabled);
@@ -45,6 +46,8 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
 
     // Use the prop directly from parent component
     const isCurrent = propIsCurrent;
+    const isRateLimited = rateLimitStatus?.disabled_accounts[account.id] !== undefined;
+    const disabledModels = rateLimitStatus?.disabled_models[account.id] || [];
 
     const handleSaveLabel = () => {
         if (onUpdateLabel) {
@@ -170,6 +173,12 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                                     {t('accounts.status.validation_required').toUpperCase()}
                                 </span>
                             )}
+                            {isRateLimited && (
+                                <span className="px-1.5 py-0.5 rounded-md bg-yellow-100 dark:bg-yellow-900/40 text-yellow-700 dark:text-yellow-400 text-[9px] font-bold flex items-center gap-1 shadow-sm border border-yellow-200/50" title={t('accounts.rate_limited_tooltip', { defaultValue: 'Too many requests recently' })}>
+                                    <Clock className="w-2.5 h-2.5" />
+                                    429 BLOCKED
+                                </span>
+                            )}
                             {/* 订阅类型徽章 */}
                             {account.quota?.subscription_tier && (() => {
                                 const tier = account.quota.subscription_tier.toLowerCase();
@@ -245,6 +254,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                                 percentage={model.data?.percentage || 0}
                                 resetTime={model.data?.reset_time}
                                 isProtected={isModelProtected(model.protectedKey)}
+                                isUnavailable={disabledModels.includes(model.id)}
                                 Icon={model.Icon}
                             />
                         ))}

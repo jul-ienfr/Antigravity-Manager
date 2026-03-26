@@ -76,6 +76,7 @@ interface AccountTableProps {
     /** 拖拽排序回调，当用户完成拖拽时触发 */
     onReorder?: (accountIds: string[]) => void;
     onViewError: (accountId: string) => void;
+    rateLimitStatus?: import('../../types/account').RateLimitStatus | null;
 }
 
 interface SortableRowProps {
@@ -96,6 +97,7 @@ interface SortableRowProps {
     onWarmup?: () => void;
     onUpdateLabel?: (label: string) => void;
     onViewError: () => void;
+    rateLimitStatus?: import('../../types/account').RateLimitStatus | null;
 }
 
 interface AccountRowContentProps {
@@ -114,6 +116,7 @@ interface AccountRowContentProps {
     onWarmup?: () => void;
     onUpdateLabel?: (label: string) => void;
     onViewError: () => void;
+    rateLimitStatus?: import('../../types/account').RateLimitStatus | null;
 }
 
 // ============================================================================
@@ -216,6 +219,7 @@ function SortableAccountRow({
     onWarmup,
     onUpdateLabel,
     onViewError,
+    rateLimitStatus,
 }: SortableRowProps) {
     const { t } = useTranslation();
     const {
@@ -282,6 +286,7 @@ function SortableAccountRow({
                 onWarmup={onWarmup}
                 onUpdateLabel={onUpdateLabel}
                 onViewError={onViewError}
+                rateLimitStatus={rateLimitStatus}
             />
         </tr>
     );
@@ -307,9 +312,13 @@ function AccountRowContent({
     onWarmup,
     onUpdateLabel,
     onViewError,
+    rateLimitStatus,
 }: AccountRowContentProps) {
     const { t } = useTranslation();
     const { config, showAllQuotas } = useConfigStore();
+
+    const isRateLimited = rateLimitStatus?.disabled_accounts[account.id] !== undefined;
+    const disabledModels = rateLimitStatus?.disabled_models[account.id] || [];
 
     // 自定义标签编辑状态
     const [isEditingLabel, setIsEditingLabel] = useState(false);
@@ -439,7 +448,12 @@ function AccountRowContent({
                                 <span>{t('accounts.status.validation_required')}</span>
                             </span>
                         )}
-
+                        {isRateLimited && (
+                            <span className="px-2 py-0.5 rounded-md bg-yellow-100 dark:bg-yellow-900/50 text-yellow-700 dark:text-yellow-400 text-[10px] font-bold flex items-center gap-1 shadow-sm border border-yellow-200/50" title={t('accounts.rate_limited_tooltip', { defaultValue: 'Too many requests recently' })}>
+                                <Clock className="w-2.5 h-2.5" />
+                                <span>429 BLOCKED</span>
+                            </span>
+                        )}
 
                         {/* 订阅类型徽章 */}
                         {account.quota?.subscription_tier && (() => {
@@ -552,6 +566,7 @@ function AccountRowContent({
                                     percentage={modelData?.percentage || 0}
                                     resetTime={modelData?.reset_time}
                                     isProtected={isModelProtected(account.protected_models, model.protectedKey)}
+                                    isUnavailable={disabledModels.includes(model.id)}
                                     Icon={MODEL_CONFIG[model.id]?.Icon || Bot}
                                 />
                             );
@@ -700,6 +715,7 @@ function AccountTable({
     onWarmup,
     onUpdateLabel,
     onViewError,
+    rateLimitStatus,
 }: AccountTableProps) {
     const { t } = useTranslation();
 
@@ -798,6 +814,7 @@ function AccountTable({
                                     onWarmup={onWarmup ? () => onWarmup(account.id) : undefined}
                                     onUpdateLabel={onUpdateLabel ? (label: string) => onUpdateLabel(account.id, label) : undefined}
                                     onViewError={() => onViewError(account.id)}
+                                    rateLimitStatus={rateLimitStatus}
                                 />
                             ))}
                         </tbody>

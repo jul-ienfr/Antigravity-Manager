@@ -43,6 +43,9 @@ pub async fn handle_generate(
     let trace_id = format!("req_{}", chrono::Utc::now().timestamp_subsec_millis());
     let debug_cfg = state.debug_logging.read().await.clone();
 
+    // [AUTO CATCHER] Intercept and Hot-Reload if this is a Genuine request
+    crate::proxy::auto_catcher::try_capture_genuine(&headers, Some(&body));
+
     // [NEW] Detect Client Adapter
     let client_adapter = CLIENT_ADAPTERS
         .iter()
@@ -93,6 +96,11 @@ pub async fn handle_generate(
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
+    
+    // [FIX 429-RACE] Immediately exclude accounts that returned 429/503 on this request.
+    let mut excluded_accounts: std::collections::HashSet<String> = std::collections::HashSet::new();
+    
+    let mut accumulated_queue_duration: u64 = 0;
 
     for attempt in 0..max_attempts {
         // 3. 模型路由解析
@@ -132,12 +140,14 @@ pub async fn handle_generate(
         let session_id = SessionManager::extract_gemini_session_id(&body, &model_name);
 
         // 关键：在重试尝试 (attempt > 0) 时强制轮换账号
+        let queue_start = std::time::Instant::now();
         let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
-            .get_token(
+            .get_token_excluding(
                 &config.request_type,
                 attempt > 0,
                 Some(&session_id),
                 &config.final_model,
+                Some(&excluded_accounts),
             )
             .await
         {
@@ -149,6 +159,8 @@ pub async fn handle_generate(
                 ));
             }
         };
+        
+        accumulated_queue_duration += queue_start.elapsed().as_millis() as u64;
 
         let mapped_model = token_manager
             .resolve_dynamic_model_for_account(&account_id, &mapped_model)
@@ -194,7 +206,10 @@ pub async fn handle_generate(
         // [FIX #1522] Inject Anthropic Beta Headers for Claude models
         let mut extra_headers = std::collections::HashMap::new();
         if mapped_model.to_lowercase().contains("claude") {
-            extra_headers.insert("anthropic-beta".to_string(), "claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14".to_string());
+            let client_beta = headers.get("anthropic-beta").and_then(|v| v.to_str().ok());
+            let combined = format!("{},interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14", client_beta.unwrap_or(""));
+            let sanitized = crate::proxy::common::utils::sanitize_anthropic_beta(Some(&combined));
+            extra_headers.insert("anthropic-beta".to_string(), sanitized);
             tracing::debug!(
                 "[Gemini] Injected Anthropic beta headers for Claude model: {}",
                 mapped_model
@@ -342,14 +357,23 @@ pub async fn handle_generate(
                         let bytes = match item {
                             Some(Ok(b)) => b,
                             Some(Err(e)) => {
-                                error!("[Gemini-SSE] Connection error: {}", e);
+                                error!("[Gemini-SSE] Stream error: {}", e);
                                 let error_json = serde_json::json!({
-                                    "error": {
-                                        "message": format!("Stream error: {}", e),
-                                        "type": "stream_error"
-                                    }
+                                    "id": &s_id_for_stream,
+                                    "object": "chat.completion.chunk",
+                                    "model": &model_name_for_stream,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {
+                                                "content": format!("\n[Stream Error] {}", e)
+                                            },
+                                            "finish_reason": "error"
+                                        }
+                                    ]
                                 });
-                                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", error_json)));
+                                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&error_json).unwrap_or_default())));
+                                yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
                                 break;
                             }
                             None => break,
@@ -426,7 +450,7 @@ pub async fn handle_generate(
 
                 if client_wants_stream {
                     let body = Body::from_stream(stream);
-                    return Ok(Response::builder()
+                    let mut resp = Response::builder()
                         .header("Content-Type", "text/event-stream")
                         .header("Cache-Control", "no-cache")
                         .header("Connection", "keep-alive")
@@ -435,7 +459,9 @@ pub async fn handle_generate(
                         .header("X-Mapped-Model", &mapped_model)
                         .body(body)
                         .unwrap()
-                        .into_response());
+                        .into_response();
+                    resp.extensions_mut().insert(crate::proxy::middleware::monitor::QueueDuration(accumulated_queue_duration));
+                    return Ok(resp);
                 } else {
                     // Collect to JSON
                     use crate::proxy::mappers::gemini::collector::collect_stream_to_json;
@@ -446,7 +472,7 @@ pub async fn handle_generate(
                                 session_id
                             );
                             let unwrapped = unwrap_response(&gemini_resp);
-                            return Ok((
+                            let mut resp = (
                                 StatusCode::OK,
                                 [
                                     ("X-Account-Email", email.as_str()),
@@ -454,7 +480,9 @@ pub async fn handle_generate(
                                 ],
                                 Json(unwrapped),
                             )
-                                .into_response());
+                                .into_response();
+                            resp.extensions_mut().insert(crate::proxy::middleware::monitor::QueueDuration(accumulated_queue_duration));
+                            return Ok(resp);
                         }
                         Err(e) => {
                             error!("Stream collection error: {}", e);
@@ -512,7 +540,7 @@ pub async fn handle_generate(
             }
 
             let unwrapped = unwrap_response(&gemini_resp);
-            return Ok((
+            let mut resp = (
                 StatusCode::OK,
                 [
                     ("X-Account-Email", email.as_str()),
@@ -520,7 +548,9 @@ pub async fn handle_generate(
                 ],
                 Json(unwrapped),
             )
-                .into_response());
+                .into_response();
+            resp.extensions_mut().insert(crate::proxy::middleware::monitor::QueueDuration(accumulated_queue_duration));
+            return Ok(resp);
         }
 
         // 处理错误并重试
@@ -559,6 +589,12 @@ pub async fn handle_generate(
 
         // 执行退避
         if apply_retry_strategy(strategy, attempt, max_attempts, status_code, &trace_id).await {
+            // [FIX 429-RACE] Exclude this account from future attempts if it returned a rate-limit error
+            if status_code == 429 || status_code == 529 || status_code == 503 {
+                excluded_accounts.insert(account_id.clone());
+                tracing::warn!("[Gemini 429-Fix] Account {} excluded from retry pool (status {})", email, status_code);
+            }
+
             // [NEW] Apply Client Adapter "let_it_crash" strategy
             if let Some(adapter) = &client_adapter {
                 if adapter.let_it_crash() && attempt > 0 {

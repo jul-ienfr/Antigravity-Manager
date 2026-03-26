@@ -8,11 +8,18 @@ pub mod server;
 pub mod token_manager;
 
 // 新架构模块
+pub mod auto_catcher; // [NEW] Phase 2 Auto Catcher
+pub mod tls; // TLS and HTTP/2 util
+pub mod launcher; // Language Server launcher (replaces smart_wrapper.js)
+pub mod pipe_mitm; // Named Pipe MITM
+pub mod ext_server_mitm; // Extension Server MITM (hex-patch varint ports)
+pub mod lsp_proxy; // Raw LSP TCP Proxy
 pub mod audio; // 音频处理模块
 pub mod cli_sync; // CLI 配置同步 (v3.3.35)
 pub mod droid_sync; // Droid (Factory CLI) 配置同步
 pub mod common; // 公共工具
 pub mod debug_logger;
+pub mod hacker; // Hack Red Team Module
 pub mod handlers; // API 端点处理器
 pub mod mappers; // 协议转换器
 pub mod middleware; // Axum 中间件
@@ -22,7 +29,9 @@ pub mod providers; // Extra upstream providers (z.ai, etc.)
 pub mod proxy_pool; // 代理池管理器
 pub mod rate_limit; // 限流跟踪
 pub mod model_specs; // 模型规格管理 (v4.1.29)
+pub mod usage_tracker; // [NEW] Sliding Window RPM/TPM Tracker
 pub mod session_manager; // 会话指纹管理
+pub mod sniffed_profile; // Profil intercepté dynamique
 pub mod signature_cache; // Signature Cache (v3.3.16)
 pub mod sticky_config; // 粘性调度配置
 pub mod upstream; // 上游客户端

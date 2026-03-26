@@ -22,6 +22,11 @@ export interface Account {
     last_used: number;
 }
 
+export interface RateLimitStatus {
+    disabled_accounts: Record<string, number>; // account_id -> ms_until
+    disabled_models: Record<string, string[]>; // account_id -> models
+}
+
 export interface TokenData {
     access_token: string;
     refresh_token: string;

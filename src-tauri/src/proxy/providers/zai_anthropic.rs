@@ -82,6 +82,14 @@ fn copy_passthrough_headers(incoming: &HeaderMap) -> HeaderMap {
             "accept-encoding" | "cache-control" => {
                 out.insert(k.clone(), v.clone());
             }
+            "anthropic-beta" => {
+                if let Ok(v_str) = v.to_str() {
+                    let sanitized = crate::proxy::common::utils::sanitize_anthropic_beta(Some(v_str));
+                    if let Ok(new_v) = HeaderValue::from_str(&sanitized) {
+                        out.insert(k.clone(), new_v);
+                    }
+                }
+            }
             _ => {}
         }
     }

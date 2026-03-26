@@ -1,8 +1,9 @@
+#![allow(warnings)]
 mod models;
 mod modules;
 mod commands;
 mod utils;
-mod proxy;  // Proxy service module
+pub mod proxy;  // Proxy service module
 pub mod error;
 pub mod constants;
 
@@ -372,7 +373,16 @@ pub fn run() {
                         info!("Admin server (port {}) started successfully", config.proxy.port);
                     }
 
-                    // 2. 自动启动转发逻辑
+                    // 2. Auto-install Hook (Hacker Feature)
+                    if config.proxy.hacker.enable_auto_hook {
+                        if let Err(e) = crate::commands::launcher::install_hook() {
+                            error!("Failed to auto-install hook: {}", e);
+                        } else {
+                            info!("Hook automatically installed at startup.");
+                        }
+                    }
+
+                    // 3. 自动启动转发逻辑
                     if config.proxy.auto_start {
                         if let Err(e) = commands::proxy::internal_start_proxy_service(
                             config.proxy,
@@ -454,6 +464,9 @@ pub fn run() {
             commands::complete_oauth_login,
             commands::cancel_oauth_login,
             commands::submit_oauth_code,
+            commands::list_oauth_clients,
+            commands::get_active_oauth_client,
+            commands::set_active_oauth_client,
             commands::import_v1_accounts,
             commands::import_from_db,
             commands::import_custom_db,
@@ -481,6 +494,7 @@ pub fn run() {
             commands::proxy::start_proxy_service,
             commands::proxy::stop_proxy_service,
             commands::proxy::get_proxy_status,
+            commands::proxy::get_rate_limit_status,
             commands::proxy::get_proxy_stats,
             commands::proxy::get_proxy_logs,
             commands::proxy::get_proxy_logs_paginated,
@@ -532,8 +546,10 @@ pub fn run() {
             commands::get_token_stats_model_trend_daily,
             commands::get_token_stats_account_trend_hourly,
             commands::get_token_stats_account_trend_daily,
+            commands::get_current_rpm,
             proxy::cli_sync::get_cli_sync_status,
             proxy::cli_sync::execute_cli_sync,
+            proxy::cli_sync::execute_claude_sync_advanced,
             proxy::cli_sync::execute_cli_restore,
             proxy::cli_sync::get_cli_config_content,
             proxy::opencode_sync::get_opencode_sync_status,
@@ -582,6 +598,8 @@ pub fn run() {
             commands::user_token::renew_user_token,
             commands::user_token::get_token_ip_bindings,
             commands::user_token::get_user_token_summary,
+            // Hacked Launcher
+            commands::launcher::launch_hacked_antigravity,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

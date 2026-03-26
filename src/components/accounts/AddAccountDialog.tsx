@@ -8,6 +8,7 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { request as invoke } from '../../utils/request';
 import { isTauri } from '../../utils/env';
 import { copyToClipboard } from '../../utils/clipboard';
+import { listOAuthClients, OAuthClientInfo } from '../../services/accountService';
 
 interface AddAccountDialogProps {
     onAdd: (email: string, refreshToken: string) => Promise<void>;
@@ -25,6 +26,8 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
     const [oauthUrl, setOauthUrl] = useState('');
     const [oauthUrlCopied, setOauthUrlCopied] = useState(false);
     const [manualCode, setManualCode] = useState('');
+    const [oauthClients, setOauthClients] = useState<OAuthClientInfo[]>([]);
+    const [selectedClient, setSelectedClient] = useState<string>('');
 
     // UI State
     const [status, setStatus] = useState<Status>('idle');
@@ -120,6 +123,17 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
         if (!isOpen) return;
         if (activeTab !== 'oauth') return;
         if (oauthUrl) return;
+
+        // Load available OAuth clients
+        listOAuthClients()
+            .then((clients) => {
+                setOauthClients(clients);
+                if (clients.length > 0 && !selectedClient) {
+                    const active = clients.find(c => c.is_active);
+                    setSelectedClient(active?.key || clients[0].key);
+                }
+            })
+            .catch(() => { /* not critical */ });
 
         invoke<any>('prepare_oauth_url')
             .then((res) => {
@@ -346,7 +360,7 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
         }
         // Default flow: opens the default browser and completes automatically.
         // (If user opened the URL manually, completion is also triggered by oauth-callback-received.)
-        handleAction(t('accounts.add.tabs.oauth'), startOAuthLogin, { clearOauthUrl: false });
+        handleAction(t('accounts.add.tabs.oauth'), () => startOAuthLogin(selectedClient || undefined), { clearOauthUrl: false });
     };
 
     const handleCompleteOAuth = () => {
@@ -543,6 +557,22 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
                                         </div>
                                     </div>
                                     <div className="space-y-3">
+                                        {oauthClients.length > 1 && (
+                                            <div className="flex items-center gap-2">
+                                                <label className="text-xs text-gray-500 dark:text-gray-400 whitespace-nowrap">
+                                                    {t('accounts.add.oauth.client_label', 'Client:')}
+                                                </label>
+                                                <select
+                                                    className="flex-1 text-xs py-1.5 px-2 bg-white dark:bg-base-100 border border-gray-200 dark:border-base-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-400"
+                                                    value={selectedClient}
+                                                    onChange={e => setSelectedClient(e.target.value)}
+                                                >
+                                                    {oauthClients.map(c => (
+                                                        <option key={c.key} value={c.key}>{c.name || c.key}</option>
+                                                    ))}
+                                                </select>
+                                            </div>
+                                        )}
                                         <button
                                             className="w-full px-4 py-3 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-xl shadow-lg shadow-blue-500/20 transition-all flex items-center justify-center gap-2 disabled:opacity-70 disabled:cursor-not-allowed"
                                             onClick={handleOAuth}

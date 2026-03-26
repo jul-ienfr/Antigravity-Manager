@@ -31,6 +31,8 @@ pub fn init_global_proxy_pool(config: Arc<RwLock<ProxyPoolConfig>>) -> Arc<Proxy
 pub struct PoolProxyConfig {
     pub proxy: rquest::Proxy,
     pub entry_id: String,
+    pub timezone: Option<String>,
+    pub locale: Option<String>,
 }
 
 /// 代理池管理器
@@ -45,6 +47,9 @@ pub struct ProxyPoolManager {
     
     /// 轮询索引 (用于 RoundRobin 策略)
     round_robin_index: Arc<AtomicUsize>,
+
+    /// [FIX] HTTP Client 缓存，用于复用连接池 (Keep-Alive)
+    client_cache: Arc<DashMap<String, Client>>,
 }
 
 impl ProxyPoolManager {
@@ -68,6 +73,7 @@ impl ProxyPoolManager {
             usage_counter: Arc::new(DashMap::new()),
             account_bindings,
             round_robin_index: Arc::new(AtomicUsize::new(0)),
+            client_cache: Arc::new(DashMap::new()),
         }
     }
 
@@ -77,96 +83,121 @@ impl ProxyPoolManager {
     /// 2. 如果无绑定，且开启了“自动全局”，取池中第一个节点
     /// 3. 如果以上均无，则检查全局上游代理 (Upstream Proxy) [由调用方 fallback]
     pub async fn get_effective_client(&self, account_id: Option<&str>, timeout_secs: u64) -> Client {
-        let mut builder = Client::builder()
-            .emulation(Emulation::Chrome123)
-            .timeout(Duration::from_secs(timeout_secs));
-        
-        // 尝试获取代理配置
+        // 提取代理详情用于构建 Cache Key
         let proxy_opt = if let Some(acc_id) = account_id {
             self.get_proxy_for_account(acc_id).await.ok().flatten()
         } else {
-            // 没有 account_id 的通用请求，如果代理池启用，则默认从中选择节点作为出口
             let config = self.config.read().await;
             if config.enabled {
                 let res = self.select_proxy_from_pool(&config).await.ok().flatten();
                 if let Some(ref p) = res {
                     tracing::info!("[Proxy] Route: Generic Request -> Proxy {} (Pool)", p.entry_id);
-                } else {
-                    // [FIX #1583] 明确记录池中无可用代理的情况
-                    tracing::warn!("[Proxy] Route: Generic Request -> No available proxy in pool, falling back to upstream or direct");
                 }
                 res
             } else {
-                tracing::debug!("[Proxy] Route: Generic Request -> Proxy pool disabled");
                 None
             }
         };
 
+        // 构建 Cache Key: proxy_id + timeout
+        let cache_key = if let Some(p) = &proxy_opt {
+            format!("proxy_{}_{}", p.entry_id, timeout_secs)
+        } else {
+            let mut up_url = String::new();
+            if let Ok(app_cfg) = crate::modules::config::load_app_config() {
+                if app_cfg.proxy.upstream_proxy.enabled {
+                    up_url = app_cfg.proxy.upstream_proxy.url.clone();
+                }
+            }
+            if up_url.is_empty() {
+                format!("direct_{}", timeout_secs)
+            } else {
+                format!("upstream_{}_{}", up_url, timeout_secs)
+            }
+        };
+
+        // 查找缓存
+        if let Some(client) = self.client_cache.get(&cache_key) {
+            return client.clone();
+        }
+
+        let mut builder = Client::builder()
+            .emulation(Emulation::Chrome136)
+            .timeout(Duration::from_secs(timeout_secs));
+
         if let Some(proxy_cfg) = proxy_opt {
             builder = builder.proxy(proxy_cfg.proxy);
-            // Already logged more detail in get_proxy_for_account or pool selection
         } else {
-            // Fallback 到应用配置的单上游代理
             if let Ok(app_cfg) = crate::modules::config::load_app_config() {
                 let up = app_cfg.proxy.upstream_proxy;
                 if up.enabled && !up.url.is_empty() {
                     if let Ok(p) = rquest::Proxy::all(&up.url) {
-                        tracing::info!("[Proxy] Route: {:?} -> Upstream: {} (AppConfig)", account_id.unwrap_or("Generic"), up.url);
                         builder = builder.proxy(p);
                     }
-                } else {
-                    tracing::info!("[Proxy] Route: {:?} -> Direct", account_id.unwrap_or("Generic"));
                 }
             }
         }
 
-        builder.build().unwrap_or_else(|_| Client::new())
+        let client = builder.build().unwrap_or_else(|_| Client::new());
+        self.client_cache.insert(cache_key, client.clone());
+        client
     }
 
     /// [NEW] 为指定账号获取“最终生效”的无特征 Standard HttpClient (专门用于纯净场景，如 OAuth 退还)
     pub async fn get_effective_standard_client(&self, account_id: Option<&str>, timeout_secs: u64) -> Client {
-        let mut builder = Client::builder()
-            // 无 Emulation 设置，走纯正的基础 TLS 指纹
-            .timeout(Duration::from_secs(timeout_secs));
-        
-        // 尝试获取代理配置
+        // 提取代理详情用于构建 Cache Key
         let proxy_opt = if let Some(acc_id) = account_id {
             self.get_proxy_for_account(acc_id).await.ok().flatten()
         } else {
-            // 没有 account_id 的通用请求，如果代理池启用，则默认从中选择节点作为出口
             let config = self.config.read().await;
             if config.enabled {
                 let res = self.select_proxy_from_pool(&config).await.ok().flatten();
-                if let Some(ref p) = res {
-                    tracing::info!("[Proxy] Route: Generic Request (Standard Client) -> Proxy {} (Pool)", p.entry_id);
-                } else {
-                    tracing::warn!("[Proxy] Route: Generic Request (Standard Client) -> No available proxy in pool, falling back to upstream or direct");
-                }
                 res
             } else {
-                tracing::debug!("[Proxy] Route: Generic Request (Standard Client) -> Proxy pool disabled");
                 None
             }
         };
 
+        // 构建 Cache Key: std_proxy_id + timeout
+        let cache_key = if let Some(p) = &proxy_opt {
+            format!("std_proxy_{}_{}", p.entry_id, timeout_secs)
+        } else {
+            let mut up_url = String::new();
+            if let Ok(app_cfg) = crate::modules::config::load_app_config() {
+                if app_cfg.proxy.upstream_proxy.enabled {
+                    up_url = app_cfg.proxy.upstream_proxy.url.clone();
+                }
+            }
+            if up_url.is_empty() {
+                format!("std_direct_{}", timeout_secs)
+            } else {
+                format!("std_upstream_{}_{}", up_url, timeout_secs)
+            }
+        };
+
+        if let Some(client) = self.client_cache.get(&cache_key) {
+            return client.clone();
+        }
+
+        let mut builder = Client::builder()
+            .timeout(Duration::from_secs(timeout_secs));
+
         if let Some(proxy_cfg) = proxy_opt {
             builder = builder.proxy(proxy_cfg.proxy);
         } else {
-            // Fallback 到应用配置的单上游代理
             if let Ok(app_cfg) = crate::modules::config::load_app_config() {
                 let up = app_cfg.proxy.upstream_proxy;
                 if up.enabled && !up.url.is_empty() {
                     if let Ok(p) = rquest::Proxy::all(&up.url) {
-                        tracing::info!("[Proxy] Route: {:?} (Standard Client) -> Upstream: {} (AppConfig)", account_id.unwrap_or("Generic"), up.url);
                         builder = builder.proxy(p);
                     }
-                } else {
-                    tracing::info!("[Proxy] Route: {:?} (Standard Client) -> Direct", account_id.unwrap_or("Generic"));
                 }
             }
         }
 
-        builder.build().unwrap_or_else(|_| Client::new())
+        let client = builder.build().unwrap_or_else(|_| Client::new());
+        self.client_cache.insert(cache_key, client.clone());
+        client
     }
 
     /// 为账号获取代理
@@ -312,6 +343,8 @@ impl ProxyPoolManager {
         Ok(PoolProxyConfig {
             proxy,
             entry_id: entry.id.clone(),
+            timezone: entry.timezone.clone(),
+            locale: entry.locale.clone(),
         })
     }
     
@@ -410,9 +443,19 @@ impl ProxyPoolManager {
 
         let concurrency_limit = 20usize;
         let results = stream::iter(proxies_to_check)
-            .map(|proxy| async move {
+            .map(|mut proxy| async move {
                 let (is_healthy, latency) = self.check_proxy_health(&proxy).await;
                 
+                // [NEW] Geolocation Spoofing: Auto-detect if missing
+                if is_healthy && proxy.timezone.is_none() {
+                    let (tz, loc) = self.detect_proxy_geolocation(&proxy).await;
+                    if tz.is_some() {
+                        proxy.timezone = tz;
+                        proxy.locale = loc;
+                        tracing::info!("[ProxyPool] Auto-detected Geolocation for {}: TZ={:?}, Locale={:?}", proxy.name, proxy.timezone, proxy.locale);
+                    }
+                }
+
                 let latency_msg = if let Some(ms) = latency {
                     format!("{}ms", ms)
                 } else {
@@ -427,7 +470,7 @@ impl ProxyPoolManager {
                     latency_msg
                 );
 
-                (proxy.id, is_healthy, latency)
+                (proxy, is_healthy, latency)
             })
             .buffer_unordered(concurrency_limit)
             .collect::<Vec<_>>()
@@ -435,11 +478,16 @@ impl ProxyPoolManager {
 
         // 统一更新状态
         let mut config = self.config.write().await;
-        for (id, is_healthy, latency) in results {
-            if let Some(proxy) = config.proxies.iter_mut().find(|p| p.id == id) {
-                proxy.is_healthy = is_healthy;
-                proxy.latency = latency;
-                proxy.last_check_time = Some(chrono::Utc::now().timestamp());
+        for (checked_proxy, is_healthy, latency) in results {
+            if let Some(p) = config.proxies.iter_mut().find(|p| p.id == checked_proxy.id) {
+                p.is_healthy = is_healthy;
+                p.latency = latency;
+                p.last_check_time = Some(chrono::Utc::now().timestamp());
+                
+                if checked_proxy.timezone.is_some() {
+                    p.timezone = checked_proxy.timezone;
+                    p.locale = checked_proxy.locale;
+                }
             }
         }
         
@@ -468,9 +516,9 @@ impl ProxyPoolManager {
 
         let client_result = Client::builder()
             .proxy(proxy_cfg.proxy)
-            .emulation(Emulation::Chrome123)
+            .emulation(Emulation::Chrome136)
             .timeout(Duration::from_secs(10))
-            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
             .build();
         
         let client = match client_result {
@@ -497,6 +545,46 @@ impl ProxyPoolManager {
                 (false, None)
             },
         }
+    }
+
+    /// [NEW] Detect proxy physical location to perfectly match Headers
+    async fn detect_proxy_geolocation(&self, entry: &ProxyEntry) -> (Option<String>, Option<String>) {
+        let proxy_res = self.build_proxy_config(entry);
+        if proxy_res.is_err() { return (None, None); }
+        
+        let client_result = Client::builder()
+            .proxy(proxy_res.unwrap().proxy)
+            .timeout(Duration::from_secs(10))
+            .build();
+            
+        if let Ok(client) = client_result {
+            if let Ok(resp) = client.get("http://ip-api.com/json/").send().await {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    let tz = json.get("timezone").and_then(|v| v.as_str()).map(String::from);
+                    let country = json.get("countryCode").and_then(|v| v.as_str()).unwrap_or("US");
+                    
+                    // Simple locale deduction based on country code
+                    let locale = match country {
+                        "FR" => "fr-FR,fr".to_string(),
+                        "DE" => "de-DE,de".to_string(),
+                        "JP" => "ja-JP,ja".to_string(),
+                        "ES" => "es-ES,es".to_string(),
+                        "GB" | "UK" => "en-GB,en".to_string(),
+                        "CA" => "en-CA,en".to_string(),
+                        "AU" => "en-AU,en".to_string(),
+                        "BR" => "pt-BR,pt".to_string(),
+                        "IT" => "it-IT,it".to_string(),
+                        "RU" => "ru-RU,ru".to_string(),
+                        "CN" => "zh-CN,zh".to_string(),
+                        "IN" => "en-IN,en".to_string(),
+                        _ => format!("en-US,en"), // Default fallback to English US
+                    };
+                    
+                    return (tz, Some(locale));
+                }
+            }
+        }
+        (None, None)
     }
 
     /// 启动健康检查循环

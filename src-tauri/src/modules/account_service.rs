@@ -39,7 +39,7 @@ impl AccountService {
 
         // 5. 持久化
         let mut account =
-            modules::upsert_account(user_info.email.clone(), user_info.get_display_name(), token)?;
+            modules::upsert_account(user_info.email.clone(), user_info.get_display_name(), token).await?;
 
         // 6. [NEW] 自动获取配额信息（用于刷新时间排序）
         let email_for_log = account.email.clone();
@@ -79,8 +79,8 @@ impl AccountService {
     }
 
     /// 删除账号逻辑
-    pub fn delete_account(&self, account_id: &str) -> Result<(), String> {
-        modules::delete_account(account_id)?;
+    pub async fn delete_account(&self, account_id: &str) -> Result<(), String> {
+        modules::delete_account(account_id).await?;
         self.integration.update_tray();
         Ok(())
     }
@@ -102,21 +102,21 @@ impl AccountService {
 
     // --- OAuth 逻辑 ---
 
-    pub async fn prepare_oauth_url(&self) -> Result<String, String> {
+    pub async fn prepare_oauth_url(&self, oauth_client_key: Option<String>) -> Result<String, String> {
         let handle = match &self.integration {
             modules::integration::SystemManager::Desktop(h) => Some(h.clone()),
             modules::integration::SystemManager::Headless => None,
         };
-        modules::oauth_server::prepare_oauth_url(handle).await
+        modules::oauth_server::prepare_oauth_url(handle, oauth_client_key).await
     }
 
-    pub async fn start_oauth_login(&self) -> Result<Account, String> {
+    pub async fn start_oauth_login(&self, oauth_client_key: Option<String>) -> Result<Account, String> {
         let handle = match &self.integration {
             modules::integration::SystemManager::Desktop(h) => Some(h.clone()),
             modules::integration::SystemManager::Headless => None,
         };
-        let token_res = modules::oauth_server::start_oauth_flow(handle).await?;
-        self.process_oauth_token(token_res).await
+        let token_res = modules::oauth_server::start_oauth_flow(handle, oauth_client_key.clone()).await?;
+        self.process_oauth_token(token_res, oauth_client_key).await
     }
 
     pub async fn complete_oauth_login(&self) -> Result<Account, String> {
@@ -124,8 +124,8 @@ impl AccountService {
             modules::integration::SystemManager::Desktop(h) => Some(h.clone()),
             modules::integration::SystemManager::Headless => None,
         };
-        let token_res = modules::oauth_server::complete_oauth_flow(handle).await?;
-        self.process_oauth_token(token_res).await
+        let token_res = modules::oauth_server::complete_oauth_flow(handle, None).await?;
+        self.process_oauth_token(token_res, None).await
     }
 
     pub fn cancel_oauth_login(&self) {
@@ -143,6 +143,7 @@ impl AccountService {
     async fn process_oauth_token(
         &self,
         token_res: modules::oauth::TokenResponse,
+        oauth_client_key: Option<String>,
     ) -> Result<Account, String> {
         let refresh_token = token_res
             .refresh_token
@@ -156,20 +157,21 @@ impl AccountService {
             .await
             .ok();
 
-        let token_data = crate::models::TokenData::new(
+        let token_data = crate::models::TokenData::new_with_client(
             token_res.access_token,
             refresh_token,
             token_res.expires_in,
             Some(user_info.email.clone()),
             project_id,
             None,
+            oauth_client_key,
         );
 
         let account = modules::upsert_account(
             user_info.email.clone(),
             user_info.get_display_name(),
             token_data,
-        )?;
+        ).await?;
 
         // 发送 UI 更新通知 (通过 integration)
         self.integration.update_tray();

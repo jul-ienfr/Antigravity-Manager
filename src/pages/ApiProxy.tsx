@@ -742,6 +742,27 @@ export default function ApiProxy() {
         saveConfig(newConfig);
     };
 
+    const updatePredictiveConfig = (updates: Partial<import('../types/config').PredictiveDistributionConfig>) => {
+        if (!appConfig) return;
+        const currentPredictive = appConfig.proxy.predictive_limits || { 
+            enabled: false, 
+            mode: 'queue', 
+            tpm_limit: 30000, 
+            rpm_limit: 14 
+        };
+        
+        const newPredictive = { ...currentPredictive, ...updates };
+
+        const newAppConfig = {
+            ...appConfig,
+            proxy: {
+                ...appConfig.proxy,
+                predictive_limits: newPredictive
+            }
+        };
+        saveConfig(newAppConfig);
+    };
+
     const handleClearSessionBindings = () => {
         setIsClearBindingsConfirmOpen(true);
     };
@@ -1885,6 +1906,119 @@ print(response.choices[0].message.content)`;
                                                 )}
                                             </div>
                                         </div>
+                                    </div>
+
+                                    {/* Predictive Limits Section */}
+                                    <div className="pt-4 border-t border-gray-100 dark:border-gray-700/50">
+                                        <div className="flex items-center justify-between mb-4">
+                                            <label className="text-xs font-medium text-gray-700 dark:text-gray-300 inline-flex items-center gap-1">
+                                                {t('proxy.config.predictive.title', { defaultValue: 'Predictive Limits (Anti-429)' })}
+                                                <HelpTooltip text={t('proxy.config.predictive.tooltip', { defaultValue: 'Proactively manage Request Per Minute (RPM) and Tokens Per Minute (TPM) limits to avoid hitting hard API rate limits.' })} />
+                                            </label>
+                                            <input
+                                                type="checkbox"
+                                                className="toggle toggle-sm toggle-info"
+                                                checked={appConfig.proxy.predictive_limits?.enabled || false}
+                                                onChange={(e) => updatePredictiveConfig({ enabled: e.target.checked })}
+                                            />
+                                        </div>
+
+                                        {appConfig.proxy.predictive_limits?.enabled && (
+                                            <div className="space-y-4 p-4 bg-gray-50 dark:bg-base-200 rounded-xl border border-gray-100 dark:border-base-300">
+                                                <div className="space-y-4">
+                                                    <div className="bg-white dark:bg-base-300 p-3 rounded border border-gray-200 dark:border-gray-700">
+                                                        <label className="text-xs font-semibold text-gray-600 dark:text-gray-400 mb-2 block">
+                                                            {t('proxy.config.predictive.mode_title', { defaultValue: 'Global Action on Limit Reached' })}
+                                                        </label>
+                                                        <select
+                                                            className="select select-bordered select-sm w-full md:w-1/2 text-xs"
+                                                            value={appConfig.proxy.predictive_limits?.mode || 'queue'}
+                                                            onChange={(e) => updatePredictiveConfig({ mode: e.target.value as 'queue' | 'reject' })}
+                                                        >
+                                                            <option value="queue">{t('proxy.config.predictive.mode_queue', { defaultValue: 'Queue Request (Default)' })}</option>
+                                                            <option value="reject">{t('proxy.config.predictive.mode_reject', { defaultValue: 'Reject with 429 Error' })}</option>
+                                                        </select>
+                                                        <p className="text-[10px] text-gray-500 mt-1">
+                                                            {appConfig.proxy.predictive_limits?.mode === 'reject' 
+                                                                ? t('proxy.config.predictive.desc_reject', { defaultValue: 'Instantly rejects the request if the limit is exceeded, useful for strict enforcement.' })
+                                                                : t('proxy.config.predictive.desc_queue', { defaultValue: 'Pauses request routing until limits refresh, maintaining high success rates.' })}
+                                                        </p>
+                                                    </div>
+                                                    
+                                                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                                                        {(['free_tier', 'pro_tier', 'ultra_tier'] as const).map(tier => {
+                                                            const predictive = appConfig.proxy.predictive_limits;
+                                                            const tierConfig = (predictive?.[tier] as import('../types/config').TierLimitConfig | undefined) || { 
+                                                                mode: tier === 'free_tier' ? 'manual' : 'auto', 
+                                                                rpm_limit: predictive?.rpm_limit || 14, 
+                                                                tpm_limit: predictive?.tpm_limit || 30000 
+                                                            };
+                                                            
+                                                            return (
+                                                                <div key={tier} className="p-3 bg-white dark:bg-base-100 rounded-lg border border-gray-200 dark:border-base-300 shadow-sm flex flex-col h-full">
+                                                                    <div className="flex justify-between items-center mb-3">
+                                                                        <span className="font-bold text-[11px] uppercase tracking-wider text-gray-700 dark:text-gray-300">
+                                                                            {tier.replace('_', ' ')}
+                                                                        </span>
+                                                                        <select
+                                                                            className="select select-bordered select-xs text-[10px]"
+                                                                            value={tierConfig.mode}
+                                                                            onChange={(e) => updatePredictiveConfig({ 
+                                                                                [tier]: { ...tierConfig, mode: e.target.value as 'auto' | 'manual' } 
+                                                                            })}
+                                                                        >
+                                                                            <option value="auto">Auto (Google)</option>
+                                                                            <option value="manual">Manual</option>
+                                                                        </select>
+                                                                    </div>
+                                                                    
+                                                                    <div className="flex-1 mt-2">
+                                                                        {tierConfig.mode === 'manual' ? (
+                                                                            <div className="space-y-4">
+                                                                                <div>
+                                                                                    <div className="flex justify-between items-center mb-1">
+                                                                                        <label className="text-[10px] font-semibold text-gray-500">RPM</label>
+                                                                                        <span className="text-[10px] font-mono text-blue-600 dark:text-blue-400">{tierConfig.rpm_limit}/min</span>
+                                                                                    </div>
+                                                                                    <DebouncedSlider
+                                                                                        min={1} max={1000} step={1}
+                                                                                        className="range range-info range-xs"
+                                                                                        value={tierConfig.rpm_limit}
+                                                                                        onChange={(val) => updatePredictiveConfig({ 
+                                                                                            [tier]: { ...tierConfig, rpm_limit: val } 
+                                                                                        })}
+                                                                                    />
+                                                                                </div>
+                                                                                <div>
+                                                                                    <div className="flex justify-between items-center mb-1">
+                                                                                        <label className="text-[10px] font-semibold text-gray-500">TPM</label>
+                                                                                        <span className="text-[10px] font-mono text-blue-600 dark:text-blue-400">{(tierConfig.tpm_limit).toLocaleString()}</span>
+                                                                                    </div>
+                                                                                    <DebouncedSlider
+                                                                                        min={1000} max={8000000} step={10000}
+                                                                                        className="range range-info range-xs"
+                                                                                        value={tierConfig.tpm_limit}
+                                                                                        onChange={(val) => updatePredictiveConfig({ 
+                                                                                            [tier]: { ...tierConfig, tpm_limit: val } 
+                                                                                        })}
+                                                                                    />
+                                                                                </div>
+                                                                            </div>
+                                                                        ) : (
+                                                                            <div className="h-full flex items-center justify-center p-4 bg-gray-50 dark:bg-base-200 rounded text-center">
+                                                                                <p className="text-[10px] text-gray-500 dark:text-gray-400 leading-relaxed">
+                                                                                    {t('proxy.config.predictive.auto_desc', { defaultValue: 'Automatically aligns with Google official limits for this tier to maximize throughput without manual tuning.' })}
+                                                                                </p>
+                                                                            </div>
+                                                                        )}
+                                                                    </div>
+                                                                </div>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        )}
                                     </div>
 
                                     {/* Circuit Breaker Section */}

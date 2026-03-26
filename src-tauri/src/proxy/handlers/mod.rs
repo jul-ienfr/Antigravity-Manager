@@ -8,4 +8,5 @@ pub mod mcp;
 pub mod common;
 pub mod audio;  // 音频转录处理器
 pub mod warmup; // 预热处理器
+pub mod sniffer; // Sniffer d'apprentissage
 

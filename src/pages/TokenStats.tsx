@@ -71,10 +71,31 @@ const shortenModelName = (model: string): string => {
         .replace('-latest', '');
 };
 
+interface RpmData {
+    global_rpm: number;
+    global_tpm: number;
+    account_rpms: Record<string, number>;
+    account_tpms: Record<string, number>;
+}
+
 const TokenStats: React.FC = () => {
     const { t } = useTranslation();
-    const [timeRange, setTimeRange] = useState<TimeRange>('daily');
-    const [viewMode, setViewMode] = useState<ViewMode>('model');
+    const [timeRange, setTimeRange] = useState<TimeRange>(() => {
+        const saved = localStorage.getItem('tokenStats_timeRange');
+        return (saved as TimeRange) || 'daily';
+    });
+    const [viewMode, setViewMode] = useState<ViewMode>(() => {
+        const saved = localStorage.getItem('tokenStats_viewMode');
+        return (saved as ViewMode) || 'model';
+    });
+
+    useEffect(() => {
+        localStorage.setItem('tokenStats_timeRange', timeRange);
+    }, [timeRange]);
+
+    useEffect(() => {
+        localStorage.setItem('tokenStats_viewMode', viewMode);
+    }, [viewMode]);
     const [chartData, setChartData] = useState<TokenStatsAggregated[]>([]);
     const [accountData, setAccountData] = useState<AccountTokenStats[]>([]);
     const [modelData, setModelData] = useState<ModelTokenStats[]>([]);
@@ -83,6 +104,7 @@ const TokenStats: React.FC = () => {
     const [allModels, setAllModels] = useState<string[]>([]);
     const [allAccounts, setAllAccounts] = useState<string[]>([]);
     const [summary, setSummary] = useState<TokenStatsSummary | null>(null);
+    const [rpmData, setRpmData] = useState<RpmData | null>(null);
     const [loading, setLoading] = useState(true);
 
     const fetchData = async () => {
@@ -168,6 +190,20 @@ const TokenStats: React.FC = () => {
     useEffect(() => {
         fetchData();
     }, [timeRange]);
+
+    useEffect(() => {
+        const fetchRpm = async () => {
+            try {
+                const data = await invoke<RpmData>('get_current_rpm');
+                setRpmData(data);
+            } catch (e) {
+                console.error('Failed to fetch RPM:', e);
+            }
+        };
+        fetchRpm();
+        const interval = setInterval(fetchRpm, 5000);
+        return () => clearInterval(interval);
+    }, []);
 
     const pieData = accountData.slice(0, 8).map((account, index) => ({
         name: account.account_email.split('@')[0] + '...',
@@ -360,7 +396,26 @@ const TokenStats: React.FC = () => {
                 </div>
 
                 {summary && (
-                    <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+                    <div className="grid grid-cols-2 md:grid-cols-6 gap-4">
+                        <div className="bg-gradient-to-br from-red-50/50 to-white dark:from-red-900/10 dark:to-gray-800 rounded-xl p-4 shadow-sm border border-red-100 dark:border-red-900/30 hover:shadow-md transition-shadow relative overflow-hidden">
+                            {rpmData && rpmData.global_rpm > 0 && (
+                                <div className="absolute top-0 right-0 w-2 h-2 mt-4 mr-4 bg-red-500 rounded-full animate-ping"></div>
+                            )}
+                            <div className="flex items-center gap-2 text-red-600/80 dark:text-red-400/80 text-sm mb-2">
+                                <div className="p-1.5 rounded-lg bg-red-100/50 dark:bg-red-900/30">
+                                    <Zap className="w-4 h-4 text-red-600 dark:text-red-400" />
+                                </div>
+                                {t('token_stats.current_rpm', 'RPM & TPM (60s)')}
+                            </div>
+                            <div className="flex flex-col gap-1">
+                                <div className="text-2xl font-bold text-red-600 dark:text-red-400 leading-tight">
+                                    {rpmData ? formatNumber(rpmData.global_rpm) : '0'} <span className="text-sm font-medium opacity-80">reqs</span>
+                                </div>
+                                <div className="text-lg font-bold text-orange-500 dark:text-orange-400 leading-tight">
+                                    {rpmData ? formatNumber(rpmData.global_tpm) : '0'} <span className="text-sm font-medium opacity-80">tokens</span>
+                                </div>
+                            </div>
+                        </div>
                         <div className="bg-gradient-to-br from-white to-gray-50 dark:from-gray-800 dark:to-gray-800/50 rounded-xl p-4 shadow-sm border border-gray-200 dark:border-gray-700 hover:shadow-md transition-shadow">
                             <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400 text-sm mb-2">
                                 <div className="p-1.5 rounded-lg bg-gray-100 dark:bg-gray-700">
@@ -737,6 +792,9 @@ const TokenStats: React.FC = () => {
                                                 {t('token_stats.output', '输出')}
                                             </th>
                                             <th className="text-right py-3 px-4 font-medium text-gray-500 dark:text-gray-400">
+                                                {t('token_stats.rpm_tpm', 'RPM / TPM')}
+                                            </th>
+                                            <th className="text-right py-3 px-4 font-medium text-gray-500 dark:text-gray-400">
                                                 {t('token_stats.total', '合计')}
                                             </th>
                                         </tr>
@@ -758,6 +816,16 @@ const TokenStats: React.FC = () => {
                                                 </td>
                                                 <td className="py-3 px-4 text-right text-purple-600">
                                                     {formatNumber(account.total_output_tokens)}
+                                                </td>
+                                                <td className="py-3 px-4 text-right">
+                                                    <div className="flex flex-col items-end gap-1">
+                                                        <span className="text-red-600 font-medium">
+                                                            {rpmData?.account_rpms?.[account.account_email] || 0} <span className="text-xs opacity-75">reqs</span>
+                                                        </span>
+                                                        <span className="text-orange-500 font-medium text-xs">
+                                                            {formatNumber(rpmData?.account_tpms?.[account.account_email] || 0)} tokens
+                                                        </span>
+                                                    </div>
                                                 </td>
                                                 <td className="py-3 px-4 text-right font-semibold text-gray-800 dark:text-white">
                                                     {formatNumber(account.total_tokens)}

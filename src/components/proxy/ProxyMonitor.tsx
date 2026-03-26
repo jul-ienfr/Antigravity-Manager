@@ -19,6 +19,7 @@ interface ProxyRequestLog {
     url: string;
     status: number;
     duration: number;
+    queue_duration?: number;
     model?: string;
     mapped_model?: string;
     error?: string;
@@ -28,6 +29,8 @@ interface ProxyRequestLog {
     output_tokens?: number;
     account_email?: string;
     protocol?: string;  // "openai" | "anthropic" | "gemini"
+    user_agent?: string;
+    client_ip?: string;
 }
 
 interface ProxyStats {
@@ -63,12 +66,14 @@ const LogTable: React.FC<LogTableProps> = ({
                     <tr>
                         <th style={{ width: '60px' }}>{t('monitor.table.status')}</th>
                         <th style={{ width: '60px' }}>{t('monitor.table.method')}</th>
-                        <th style={{ width: '220px' }}>{t('monitor.table.model')}</th>
+                        <th style={{ width: '160px' }}>{t('monitor.table.model')}</th>
                         <th style={{ width: '70px' }}>{t('monitor.table.protocol')}</th>
-                        <th style={{ width: '140px' }}>{t('monitor.table.account')}</th>
-                        <th style={{ width: '180px' }}>{t('monitor.table.path')}</th>
-                        <th className="text-right" style={{ width: '90px' }}>{t('monitor.table.usage')}</th>
-                        <th className="text-right" style={{ width: '80px' }}>{t('monitor.table.duration')}</th>
+                        <th style={{ width: '220px' }}>{t('monitor.table.account')}</th>
+                        <th style={{ width: '130px' }}>{t('monitor.table.machine')}</th>
+                        <th style={{ width: 'auto' }}>{t('monitor.table.application')}</th>
+                        <th style={{ width: '200px' }}>{t('monitor.table.path')}</th>
+                        <th className="text-right" style={{ width: '80px' }}>{t('monitor.table.usage')}</th>
+                        <th className="text-right" style={{ width: '70px' }}>{t('monitor.table.duration')}</th>
                         <th className="text-right" style={{ width: '80px' }}>{t('monitor.table.time')}</th>
                     </tr>
                 </thead>
@@ -80,12 +85,12 @@ const LogTable: React.FC<LogTableProps> = ({
                             onClick={() => onLogClick(log)}
                         >
                             <td style={{ width: '60px' }}>
-                                <span className={`badge badge-xs text-white border-none ${log.status >= 200 && log.status < 400 ? 'badge-success' : 'badge-error'}`}>
-                                    {log.status}
+                                <span className={`badge badge-xs text-white border-none ${log.status === 0 ? 'bg-orange-400 animate-pulse text-[9px]' : log.status >= 200 && log.status < 400 ? 'badge-success' : 'badge-error'}`}>
+                                    {log.status === 0 ? 'PEND' : log.status}
                                 </span>
                             </td>
                             <td className="font-bold" style={{ width: '60px' }}>{log.method}</td>
-                            <td className="text-blue-600 truncate" style={{ width: '220px', maxWidth: '220px' }}>
+                            <td className="text-blue-600 truncate" style={{ width: '160px', maxWidth: '160px' }}>
                                 {log.mapped_model && log.model !== log.mapped_model
                                     ? `${log.model} => ${log.mapped_model}`
                                     : (log.model || '-')}
@@ -102,15 +107,35 @@ const LogTable: React.FC<LogTableProps> = ({
                                     </span>
                                 )}
                             </td>
-                            <td className="text-gray-600 dark:text-gray-400 truncate text-[10px]" style={{ width: '140px', maxWidth: '140px' }} title={log.account_email || ''}>
-                                {log.account_email ? log.account_email.replace(/(.{3}).*(@.*)/, '$1***$2') : '-'}
+                            <td className="text-gray-600 dark:text-gray-400 truncate text-[10px]" style={{ width: '220px', maxWidth: '220px' }} title={log.account_email || ''}>
+                                {log.account_email || '-'}
                             </td>
-                            <td className="truncate" style={{ width: '180px', maxWidth: '180px' }}>{log.url}</td>
-                            <td className="text-right text-[9px]" style={{ width: '90px' }}>
+                            <td className="text-gray-600 dark:text-gray-400 truncate text-[10px]" style={{ width: '130px', maxWidth: '130px' }} title={log.client_ip || ''}>
+                                {log.client_ip || '-'}
+                            </td>
+                            <td className="text-gray-600 dark:text-gray-400 truncate text-[10px]" style={{ maxWidth: '400px' }} title={log.user_agent || ''}>
+                                {log.user_agent || '-'}
+                            </td>
+                            <td className="truncate" style={{ width: '200px', maxWidth: '200px' }}>{log.url}</td>
+                            <td className="text-right text-[9px]" style={{ width: '80px' }}>
                                 {log.input_tokens != null && <div>I: {formatCompactNumber(log.input_tokens)}</div>}
                                 {log.output_tokens != null && <div>O: {formatCompactNumber(log.output_tokens)}</div>}
                             </td>
-                            <td className="text-right" style={{ width: '80px' }}>{log.duration}ms</td>
+                            <td className="text-right" style={{ width: '80px' }}>
+                                {log.status === 0 ? (
+                                    <span className="text-orange-500 font-bold animate-pulse text-[10px]">WAITING...</span>
+                                ) : (
+                                    <div className="flex flex-col gap-0.5 justify-end">
+                                        <span className="text-gray-900 dark:text-gray-100 font-bold">{log.duration}ms</span>
+                                        {log.queue_duration != null && log.queue_duration > 0 && (
+                                            <span className="text-[9px] text-orange-500" title="Queue Time">Q: {log.queue_duration}ms</span>
+                                        )}
+                                        {log.queue_duration != null && (
+                                            <span className="text-[9px] text-blue-500" title="Upstream Time">API: {Math.max(0, log.duration - log.queue_duration)}ms</span>
+                                        )}
+                                    </div>
+                                )}
+                            </td>
                             <td className="text-right text-[10px]" style={{ width: '80px' }}>
                                 {new Date(log.timestamp).toLocaleTimeString()}
                             </td>
@@ -152,8 +177,19 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     const [isLoggingEnabled, setIsLoggingEnabled] = useState(false);
     const [isClearConfirmOpen, setIsClearConfirmOpen] = useState(false);
     const [copiedRequestId, setCopiedRequestId] = useState<string | null>(null);
+    const [liveWaitMs, setLiveWaitMs] = useState<number>(0);
 
     const { accounts, fetchAccounts } = useAccountStore();
+
+    useEffect(() => {
+        if (selectedLog?.status === 0) {
+            setLiveWaitMs(Date.now() - selectedLog.timestamp);
+            const interval = setInterval(() => {
+                setLiveWaitMs(Date.now() - selectedLog.timestamp);
+            }, 100);
+            return () => clearInterval(interval);
+        }
+    }, [selectedLog]);
 
     // Pagination state
     const PAGE_SIZE_OPTIONS = [50, 100, 200, 500];
@@ -283,7 +319,8 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
         loadData();
         fetchAccounts();
 
-        let unlistenFn: (() => void) | null = null;
+        let unlistenCompletedFn: (() => void) | null = null;
+        let unlistenPendingFn: (() => void) | null = null;
         let updateTimeout: number | null = null;
 
         const setupListener = async () => {
@@ -296,40 +333,35 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
             listenerSetupRef.current = true;
 
             console.debug('[ProxyMonitor] Setting up event listener for proxy://request');
-            unlistenFn = await listen<ProxyRequestLog>('proxy://request', (event) => {
-                if (!isMountedRef.current) return;
 
-                const newLog = event.payload;
-
-                // 移除 body 以减少内存占用
-                const logSummary = {
+            const handleLogEvent = (newLog: ProxyRequestLog) => {
+                // Keep body for pending requests so users can inspect what is waiting, remove for completed
+                const logSummary = newLog.status === 0 ? newLog : {
                     ...newLog,
                     request_body: undefined,
                     response_body: undefined
                 };
 
-                // Check if this log already exists (deduplicate at event level)
-                const alreadyExists = pendingLogsRef.current.some(log => log.id === newLog.id);
-                if (alreadyExists) {
-                    console.debug('[ProxyMonitor] Duplicate event ignored:', newLog.id);
-                    return;
+                // Add or update pendingLogsRef
+                const existingIndex = pendingLogsRef.current.findIndex(l => l.id === logSummary.id);
+                if (existingIndex >= 0) {
+                    pendingLogsRef.current[existingIndex] = logSummary;
+                } else {
+                    pendingLogsRef.current.push(logSummary);
                 }
 
-                pendingLogsRef.current.push(logSummary);
-
-                // 防抖:每 500ms 批量更新一次
-                if (updateTimeout) clearTimeout(updateTimeout);
-                updateTimeout = setTimeout(async () => {
+                if (updateTimeout) window.clearTimeout(updateTimeout);
+                updateTimeout = window.setTimeout(async () => {
                     if (!isMountedRef.current) return;
 
                     const currentPending = pendingLogsRef.current;
                     if (currentPending.length > 0) {
                         setLogs(prev => {
-                            // Deduplicate by id
-                            const existingIds = new Set(prev.map(log => log.id));
-                            const uniqueNewLogs = currentPending.filter(log => !existingIds.has(log.id));
-                            // Merge and sort by timestamp descending (newest first)
-                            const merged = [...uniqueNewLogs, ...prev];
+                            const newMap = new Map<string, ProxyRequestLog>();
+                            prev.forEach(log => newMap.set(log.id, log));
+                            currentPending.forEach(log => newMap.set(log.id, log));
+                            
+                            const merged = Array.from(newMap.values());
                             merged.sort((a, b) => b.timestamp - a.timestamp);
                             return merged.slice(0, 100);
                         });
@@ -351,6 +383,16 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                         pendingLogsRef.current = [];
                     }
                 }, 500);
+            };
+
+            unlistenPendingFn = await listen<ProxyRequestLog>('proxy://request_pending', (event) => {
+                if (!isMountedRef.current) return;
+                handleLogEvent(event.payload);
+            });
+
+            unlistenCompletedFn = await listen<ProxyRequestLog>('proxy://request', (event) => {
+                if (!isMountedRef.current) return;
+                handleLogEvent(event.payload);
             });
         };
         setupListener();
@@ -370,7 +412,8 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
         return () => {
             isMountedRef.current = false;
             listenerSetupRef.current = false;
-            if (unlistenFn) unlistenFn();
+            if (unlistenPendingFn) unlistenPendingFn();
+            if (unlistenCompletedFn) unlistenCompletedFn();
             if (updateTimeout) clearTimeout(updateTimeout);
             if (pollInterval) clearInterval(pollInterval);
         };
@@ -409,6 +452,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
         { label: t('monitor.filters.chat'), value: 'completions' },
         { label: t('monitor.filters.gemini'), value: 'gemini' },
         { label: t('monitor.filters.claude'), value: 'claude' },
+        { label: 'OpenAI', value: 'openai' },
         { label: t('monitor.filters.images'), value: 'images' }
     ];
 
@@ -576,7 +620,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
 
             {selectedLog && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setSelectedLog(null)}>
-                    <div className="bg-white dark:bg-base-100 rounded-xl shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col overflow-hidden border border-gray-200 dark:border-base-300" onClick={e => e.stopPropagation()}>
+                    <div className="bg-white dark:bg-base-100 rounded-xl shadow-2xl w-full max-w-5xl max-h-[90vh] flex flex-col overflow-hidden border border-gray-200 dark:border-base-300" onClick={e => e.stopPropagation()}>
                         {/* Modal Header */}
                         <div className="px-4 py-3 border-b border-gray-100 dark:border-base-300 flex items-center justify-between bg-gray-50 dark:bg-base-200">
                             <div className="flex items-center gap-3">
@@ -599,7 +643,13 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                                     </div>
                                     <div className="space-y-1.5">
                                         <span className="block text-gray-500 dark:text-gray-400 uppercase font-black text-[10px] tracking-widest">{t('monitor.details.duration')}</span>
-                                        <span className="font-mono font-semibold text-gray-900 dark:text-base-content text-xs">{selectedLog.duration}ms</span>
+                                        {selectedLog.status === 0 ? (
+                                            <span className="font-mono font-semibold text-orange-500 text-xs animate-pulse">
+                                                {t('monitor.details.waiting_since', `EN ATTENTE : ${(liveWaitMs / 1000).toFixed(1)}s`)}
+                                            </span>
+                                        ) : (
+                                            <span className="font-mono font-semibold text-gray-900 dark:text-base-content text-xs">{selectedLog.duration}ms</span>
+                                        )}
                                     </div>
                                     <div className="space-y-1.5">
                                         <span className="block text-gray-500 dark:text-gray-400 uppercase font-black text-[10px] tracking-widest">{t('monitor.details.tokens')}</span>

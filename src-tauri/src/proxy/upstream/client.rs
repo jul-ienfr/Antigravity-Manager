@@ -4,6 +4,7 @@
 use dashmap::DashMap;
 use rquest::{header, Client, Response, StatusCode};
 use serde_json::Value;
+use sha2::{Sha256, Digest};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::Duration;
@@ -51,16 +52,18 @@ const V1_INTERNAL_BASE_URL_SANDBOX: &str =
     "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal";
 
 const V1_INTERNAL_BASE_URL_FALLBACKS: [&str; 3] = [
-    V1_INTERNAL_BASE_URL_SANDBOX, // 优先级 1: Sandbox (已知有效且稳定)
-    V1_INTERNAL_BASE_URL_DAILY,   // 优先级 2: Daily (备用)
-    V1_INTERNAL_BASE_URL_PROD,    // 优先级 3: Prod (仅作为兜底)
+    V1_INTERNAL_BASE_URL_PROD,    // Priority 1: Prod (legitimate client behavior)
+    V1_INTERNAL_BASE_URL_DAILY,   // Priority 2: Daily (fallback on 429/5xx)
+    V1_INTERNAL_BASE_URL_SANDBOX, // Priority 3: Sandbox (last resort)
 ];
 
 pub struct UpstreamClient {
     default_client: Client,
     proxy_pool: Option<Arc<crate::proxy::proxy_pool::ProxyPoolManager>>,
     client_cache: DashMap<String, Client>, // proxy_id -> Client
+    account_clients: DashMap<String, Client>, // [NEW] account_id -> Client (Stealth Mode)
     user_agent_override: RwLock<Option<String>>,
+    base_proxy_config: Option<crate::proxy::config::UpstreamProxyConfig>, // Store proxy config to recreate isolated clients
 }
 
 impl UpstreamClient {
@@ -92,7 +95,9 @@ impl UpstreamClient {
             default_client,
             proxy_pool,
             client_cache: DashMap::new(),
+            account_clients: DashMap::new(),
             user_agent_override: RwLock::new(None),
+            base_proxy_config: proxy_config,
         }
     }
 
@@ -100,8 +105,16 @@ impl UpstreamClient {
     fn build_client_internal(
         proxy_config: Option<crate::proxy::config::UpstreamProxyConfig>,
     ) -> Result<Client, rquest::Error> {
+        let emulation = crate::proxy::sniffed_profile::get_impersonation_config()
+            .map(|c| c.network.tls_emulation)
+            .unwrap_or_else(|| "Chrome142".to_string());
+        let emul_enum = match emulation.as_str() {
+            "Chrome142" => rquest_util::Emulation::Chrome136, // Highest natively supported by rquest 5.1.0
+            _ => rquest_util::Emulation::Chrome136,
+        };
+
         let mut builder = Client::builder()
-            .emulation(rquest_util::Emulation::Chrome123)
+            .emulation(emul_enum)
             // Connection settings (优化连接复用，减少建立开销)
             .connect_timeout(Duration::from_secs(20))
             .pool_max_idle_per_host(16) // 每主机最多 16 个空闲连接
@@ -129,9 +142,17 @@ impl UpstreamClient {
         &self,
         proxy_config: crate::proxy::proxy_pool::PoolProxyConfig,
     ) -> Result<Client, rquest::Error> {
+        let emulation = crate::proxy::sniffed_profile::get_impersonation_config()
+            .map(|c| c.network.tls_emulation)
+            .unwrap_or_else(|| "Chrome142".to_string());
+        let emul_enum = match emulation.as_str() {
+            "Chrome142" => rquest_util::Emulation::Chrome136, // Highest natively supported by rquest 5.1.0
+            _ => rquest_util::Emulation::Chrome136,
+        };
+
         // Reuse base settings similar to default client but with specific proxy
         let builder = Client::builder()
-            .emulation(rquest_util::Emulation::Chrome123)
+            .emulation(emul_enum)
             .connect_timeout(Duration::from_secs(20))
             .pool_max_idle_per_host(16)
             .pool_idle_timeout(Duration::from_secs(90))
@@ -195,16 +216,16 @@ impl UpstreamClient {
                                 return client;
                             }
                             Err(e) => {
-                                tracing::error!("Failed to build client for proxy {}: {}, falling back to default", proxy_cfg.entry_id, e);
+                                tracing::error!("Failed to build client for proxy {}: {}, falling back to isolated account client", proxy_cfg.entry_id, e);
                             }
                         }
                     }
                     Ok(None) => {
-                        // No proxy found or required for this account, use default
+                        // No proxy found or required for this account, use isolated account client
                     }
                     Err(e) => {
                         tracing::error!(
-                            "Error getting proxy for account {}: {}, falling back to default",
+                            "Error getting proxy for account {}: {}, falling back to isolated account client",
                             acc_id,
                             e
                         );
@@ -212,8 +233,40 @@ impl UpstreamClient {
                 }
             }
         }
-        // Fallback to default client
+        
+        // [STEALTH MODE] Fallback to generating an isolated, pure client per account
+        if let Some(acc_id) = account_id {
+            if let Some(client) = self.account_clients.get(acc_id) {
+                return client.clone();
+            }
+            
+            // Rebuild client to create an isolated TCP/TLS session, carrying the base proxy config
+            match Self::build_client_internal(self.base_proxy_config.clone()) {
+                Ok(client) => {
+                    self.account_clients.insert(acc_id.to_string(), client.clone());
+                    tracing::info!("[Stealth Mode] Created isolated TLS client for account: {}", acc_id);
+                    return client;
+                }
+                Err(e) => {
+                    tracing::error!("Failed to build isolated client for account {}: {}", acc_id, e);
+                }
+            }
+        }
+
+        // Fallback to default global client (e.g. for unauthenticated requests)
         self.default_client.clone()
+    }
+
+    /// [NEW] Get detected Timezone and Locale from the assigned proxy in the pool
+    pub async fn get_geolocation_headers(&self, account_id: Option<&str>) -> (Option<String>, Option<String>) {
+        if let Some(pool) = &self.proxy_pool {
+            if let Some(acc_id) = account_id {
+                if let Ok(Some(proxy_cfg)) = pool.get_proxy_for_account(acc_id).await {
+                    return (proxy_cfg.timezone, proxy_cfg.locale);
+                }
+            }
+        }
+        (None, None)
     }
 
     /// Build v1internal URL
@@ -222,6 +275,68 @@ impl UpstreamClient {
             format!("{}:{}?{}", base_url, method, qs)
         } else {
             format!("{}:{}", base_url, method)
+        }
+    }
+
+    /// Convert SHA256 hash bytes to a base36 string (a-z, 0-9).
+    /// This matches the character set used by real Antigravity DeviceProfile IDs.
+    /// VERIFIED: Real machine_id uses lowercase alphanumeric (a-z, 0-9), NOT hex.
+    fn sha256_to_base36(input: &[u8], len: usize) -> String {
+        const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+        let mut hasher = Sha256::new();
+        hasher.update(input);
+        let hash = hasher.finalize();
+        hash.iter()
+            .take(len)
+            .map(|b| CHARSET[(*b as usize) % 36] as char)
+            .collect()
+    }
+
+    /// Derive a stable, deterministic machine-id for a given account.
+    /// VERIFIED FORMAT from real captured traffic:
+    ///   vscode-sessionid: auth0|user_okz1zsd3ulswlorcjfhu7mxo6fvocse7
+    ///   x-machine-id: (same format)
+    /// Format: "auth0|user_" + 32 lowercase alphanumeric chars (a-z, 0-9)
+    /// Each account gets a unique, stable machine-id derived from its account_id.
+    fn derive_per_account_machine_id(account_id: Option<&str>) -> String {
+        match account_id {
+            Some(aid) => {
+                let input = format!("antigravity-machine-id:{}", aid);
+                let random_part = Self::sha256_to_base36(input.as_bytes(), 32);
+                format!("auth0|user_{}", random_part)
+            }
+            None => {
+                // Fallback: derive from hardware ID but still in correct format
+                let hw_id = machine_uid::get().unwrap_or_else(|_| "fallback-hw-id".to_string());
+                let input = format!("antigravity-machine-id-hw:{}", hw_id);
+                let random_part = Self::sha256_to_base36(input.as_bytes(), 32);
+                format!("auth0|user_{}", random_part)
+            }
+        }
+    }
+
+    /// Derive a stable device-id (UUID format) for x-market-user-id.
+    /// VERIFIED from real captured traffic:
+    ///   x-market-user-id: 915b05db-833e-45ae-b7aa-6eda81c7c9d3
+    /// This corresponds to DeviceProfile.dev_device_id (UUID v4 format).
+    fn derive_per_account_device_id(account_id: Option<&str>) -> String {
+        match account_id {
+            Some(aid) => {
+                let mut hasher = Sha256::new();
+                hasher.update(b"antigravity-dev-device-id:");
+                hasher.update(aid.as_bytes());
+                let hash = format!("{:x}", hasher.finalize());
+                // Format as UUID v4: xxxxxxxx-xxxx-4xxx-[89ab]xxx-xxxxxxxxxxxx
+                format!(
+                    "{}-{}-4{}-a{}-{}",
+                    &hash[0..8],
+                    &hash[8..12],
+                    &hash[12..15],
+                    &hash[15..18],
+                    &hash[18..30]
+                )
+            }
+            None => uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -276,45 +391,35 @@ impl UpstreamClient {
             header::CONTENT_TYPE,
             header::HeaderValue::from_static("application/json"),
         );
-        headers.insert(
-            header::AUTHORIZATION,
-            header::HeaderValue::from_str(&format!("Bearer {}", access_token))
-                .map_err(|e| e.to_string())?,
-        );
 
-        headers.insert(
-            header::USER_AGENT,
-            header::HeaderValue::from_str(&self.get_user_agent().await).unwrap_or_else(|e| {
-                tracing::warn!("Invalid User-Agent header value, using fallback: {}", e);
-                header::HeaderValue::from_static("antigravity")
-            }),
-        );
-
-        // [ENHANCED] 注入 Antigravity 官方客户端关键特征 Headers
-        // 1. Client Identity
-        headers.insert(
-            "x-client-name",
-            header::HeaderValue::from_static("antigravity"),
-        );
-        if let Ok(ver) = header::HeaderValue::from_str(&crate::constants::CURRENT_VERSION) {
-            headers.insert("x-client-version", ver);
+        if let Some(config) = crate::proxy::sniffed_profile::get_impersonation_config() {
+            for (k, v) in &config.network.static_headers {
+                if let Ok(hk) = header::HeaderName::from_bytes(k.as_bytes()) {
+                    if let Ok(hv) = header::HeaderValue::from_str(v) {
+                        headers.insert(hk, hv);
+                    }
+                }
+            }
+            for (k, v) in &config.network.dynamic_headers {
+                // Ignore authorization from impersonation as we explicitly override it later
+                if k.to_lowercase() == "authorization" {
+                    continue;
+                }
+                if let Ok(hk) = header::HeaderName::from_bytes(k.as_bytes()) {
+                    if let Ok(hv) = header::HeaderValue::from_str(v) {
+                        headers.insert(hk, hv);
+                    }
+                }
+            }
         }
 
-        // 2. Device & Session Identity
-        // Machine ID (Persistent)
-        if let Ok(mid) = machine_uid::get() {
-             if let Ok(mid_val) = header::HeaderValue::from_str(&mid) {
-                 headers.insert("x-machine-id", mid_val);
-             }
+        // [FIX] Unconditionally inject the dynamically refreshed Authorization token from TokenManager.
+        // This restores the original auto-refresh capability that was broken by strict JSON header emulation.
+        if !access_token.is_empty() {
+            if let Ok(hv) = header::HeaderValue::from_str(&format!("Bearer {}", access_token)) {
+                headers.insert(header::AUTHORIZATION, hv);
+            }
         }
-        // Session ID (Per App Launch)
-        if let Ok(sess_val) = header::HeaderValue::from_str(&crate::constants::SESSION_ID) {
-            headers.insert("x-vscode-sessionid", sess_val);
-        }
-
-        // [REMOVED v4.1.24] x-goog-api-client (gl-node/fire/grpc) header has been removed.
-        // This header belongs to the IDE's JS layer, not the official client's egress.
-        // Sending it creates a contradictory "Electron + Node.js" fingerprint.
 
         // 注入额外的 Headers (如 anthropic-beta)
         for (k, v) in extra_headers {
@@ -322,6 +427,21 @@ impl UpstreamClient {
                 if let Ok(hv) = header::HeaderValue::from_str(&v) {
                     headers.insert(hk, hv);
                 }
+            }
+        }
+
+        // [NEW] Inject Auto-Detected Geolocation Headers for Stealth
+        let (tz, locale) = self.get_geolocation_headers(account_id).await;
+        if let Some(t) = tz {
+            if let Ok(hv) = header::HeaderValue::from_str(&t) {
+                // Not standard HTTP but widely used in modern APIs to resolve locale
+                headers.insert("Timezone", hv); 
+            }
+        }
+        if let Some(l) = locale {
+            if let Ok(hv) = header::HeaderValue::from_str(&l) {
+                // Official Accept-Language Header matching the Proxy's physical country
+                headers.insert(header::ACCEPT_LANGUAGE, hv);
             }
         }
 

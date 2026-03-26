@@ -320,7 +320,7 @@ mod tests {
 }
 
 /// Global account write lock to prevent corruption during concurrent operations
-static ACCOUNT_INDEX_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static ACCOUNT_INDEX_LOCK: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
 
 // ... existing constants ...
 const DATA_DIR: &str = ".antigravity_tools";
@@ -379,6 +379,10 @@ fn load_account_index_in_dir(data_dir: &PathBuf) -> Result<AccountIndex, String>
 
     let raw_content = fs::read(&index_path)
         .map_err(|e| format!("failed_to_read_account_index: {}", e))?;
+
+    if raw_content.len() > 2_097_152 { // Sécurité (bloque si > 2 MB max)
+        return Err("Payload corrompu ou surcharge mémoire contrée (OOM)".to_string());
+    }
 
     // If file is empty, attempt recovery
     if raw_content.is_empty() {
@@ -531,15 +535,12 @@ fn sanitize_index_content(raw: &[u8]) -> String {
         raw
     };
 
-    // Skip leading NUL bytes
-    let without_nul = without_bom
-        .iter()
-        .skip_while(|&&b| b == 0x00)
-        .copied()
-        .collect::<Vec<u8>>();
+    // Skip leading NUL bytes efficiently without allocating a new vector
+    let first_valid_idx = without_bom.iter().position(|&b| b != 0x00).unwrap_or(without_bom.len());
+    let sanitized_slice = &without_bom[first_valid_idx..];
 
     // Convert to string (lossy - invalid UTF-8 sequences become replacement chars)
-    String::from_utf8_lossy(&without_nul).into_owned()
+    String::from_utf8_lossy(sanitized_slice).into_owned()
 }
 
 /// Best-effort save of recovered index without deadlocking
@@ -698,14 +699,12 @@ pub fn list_accounts() -> Result<Vec<Account>, String> {
 }
 
 /// Add account
-pub fn add_account(
+pub async fn add_account(
     email: String,
     name: Option<String>,
     token: TokenData,
 ) -> Result<Account, String> {
-    let _lock = ACCOUNT_INDEX_LOCK
-        .lock()
-        .map_err(|e| format!("failed_to_acquire_lock: {}", e))?;
+    let _lock = ACCOUNT_INDEX_LOCK.lock().await;
     let mut index = load_account_index()?;
 
     // Check if account already exists
@@ -744,14 +743,12 @@ pub fn add_account(
 }
 
 /// Add or update account
-pub fn upsert_account(
+pub async fn upsert_account(
     email: String,
     name: Option<String>,
     token: TokenData,
 ) -> Result<Account, String> {
-    let _lock = ACCOUNT_INDEX_LOCK
-        .lock()
-        .map_err(|e| format!("failed_to_acquire_lock: {}", e))?;
+    let _lock = ACCOUNT_INDEX_LOCK.lock().await;
     let mut index = load_account_index()?;
 
     // Find account ID if exists
@@ -811,20 +808,40 @@ pub fn upsert_account(
         }
     }
 
-    // Add if not exists
-    // Note: add_account will attempt to acquire lock, which would deadlock here.
-    // Use an internal version or release lock.
+    // Insert in-place without dropping lock (Fix Race Condition TOCTOU)
+    // Create new account
+    let account_id = Uuid::new_v4().to_string();
+    let mut account = Account::new(account_id.clone(), email.clone(), token);
+    account.name = name.clone();
 
-    // Release lock, let add_account handle it
-    drop(_lock);
-    add_account(email, name, token)
+    // Save account data
+    save_account(&account)?;
+
+    // Update index summary
+    index.accounts.push(AccountSummary {
+        id: account.id.clone(),
+        email: account.email.clone(),
+        name: account.name.clone(),
+        disabled: account.disabled,
+        proxy_disabled: account.proxy_disabled,
+        protected_models: account.protected_models.clone(),
+        created_at: account.created_at,
+        last_used: account.last_used,
+    });
+
+    // If first account, set as current
+    if index.current_account_id.is_none() {
+        index.current_account_id = Some(account_id);
+    }
+
+    save_account_index(&index)?;
+
+    Ok(account)
 }
 
 /// Delete account
-pub fn delete_account(account_id: &str) -> Result<(), String> {
-    let _lock = ACCOUNT_INDEX_LOCK
-        .lock()
-        .map_err(|e| format!("failed_to_acquire_lock: {}", e))?;
+pub async fn delete_account(account_id: &str) -> Result<(), String> {
+    let _lock = ACCOUNT_INDEX_LOCK.lock().await;
     let mut index = load_account_index()?;
 
     // Remove from index
@@ -858,10 +875,8 @@ pub fn delete_account(account_id: &str) -> Result<(), String> {
 }
 
 /// Batch delete accounts (atomic index operation)
-pub fn delete_accounts(account_ids: &[String]) -> Result<(), String> {
-    let _lock = ACCOUNT_INDEX_LOCK
-        .lock()
-        .map_err(|e| format!("failed_to_acquire_lock: {}", e))?;
+pub async fn delete_accounts(account_ids: &[String]) -> Result<(), String> {
+    let _lock = ACCOUNT_INDEX_LOCK.lock().await;
     let mut index = load_account_index()?;
 
     let accounts_dir = get_accounts_dir()?;
@@ -895,10 +910,8 @@ pub fn delete_accounts(account_ids: &[String]) -> Result<(), String> {
 
 /// Reorder account list
 /// Update account order in index file based on provided IDs
-pub fn reorder_accounts(account_ids: &[String]) -> Result<(), String> {
-    let _lock = ACCOUNT_INDEX_LOCK
-        .lock()
-        .map_err(|e| format!("failed_to_acquire_lock: {}", e))?;
+pub async fn reorder_accounts(account_ids: &[String]) -> Result<(), String> {
+    let _lock = ACCOUNT_INDEX_LOCK.lock().await;
     let mut index = load_account_index()?;
 
     // Create a map of account ID to summary
@@ -941,9 +954,7 @@ pub async fn switch_account(
     use crate::modules::oauth;
 
     let index = {
-        let _lock = ACCOUNT_INDEX_LOCK
-            .lock()
-            .map_err(|e| format!("failed_to_acquire_lock: {}", e))?;
+        let _lock = ACCOUNT_INDEX_LOCK.lock().await;
         load_account_index()?
     };
 
@@ -989,9 +1000,7 @@ pub async fn switch_account(
 
     // 4. Update tool internal state
     {
-        let _lock = ACCOUNT_INDEX_LOCK
-            .lock()
-            .map_err(|e| format!("failed_to_acquire_lock: {}", e))?;
+        let _lock = ACCOUNT_INDEX_LOCK.lock().await;
         let mut index = load_account_index()?;
         index.current_account_id = Some(account_id.to_string());
         save_account_index(&index)?;
@@ -1188,17 +1197,15 @@ pub fn get_current_account() -> Result<Option<Account>, String> {
 }
 
 /// Set current active account ID
-pub fn set_current_account_id(account_id: &str) -> Result<(), String> {
-    let _lock = ACCOUNT_INDEX_LOCK
-        .lock()
-        .map_err(|e| format!("failed_to_acquire_lock: {}", e))?;
+pub async fn set_current_account_id(account_id: &str) -> Result<(), String> {
+    let _lock = ACCOUNT_INDEX_LOCK.lock().await;
     let mut index = load_account_index()?;
     index.current_account_id = Some(account_id.to_string());
     save_account_index(&index)
 }
 
 /// Update account quota
-pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), String> {
+pub async fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), String> {
     let mut account = load_account(account_id)?;
     account.update_quota(quota);
 
@@ -1268,9 +1275,7 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
 
     // [FIX] 同时更新索引文件中的摘要信息，确保列表页图标即时刷新
     {
-        let _lock = ACCOUNT_INDEX_LOCK
-            .lock()
-            .map_err(|e| format!("failed_to_acquire_lock: {}", e))?;
+        let _lock = ACCOUNT_INDEX_LOCK.lock().await;
         if let Ok(mut index) = load_account_index() {
             if let Some(summary) = index.accounts.iter_mut().find(|a| a.id == account_id) {
                 summary.protected_models = account.protected_models.clone();
@@ -1287,14 +1292,12 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
 }
 
 /// Toggle proxy disabled status for an account
-pub fn toggle_proxy_status(
+pub async fn toggle_proxy_status(
     account_id: &str,
     enable: bool,
     reason: Option<&str>,
 ) -> Result<(), String> {
-    let _lock = ACCOUNT_INDEX_LOCK
-        .lock()
-        .map_err(|e| format!("failed_to_acquire_lock: {}", e))?;
+    let _lock = ACCOUNT_INDEX_LOCK.lock().await;
 
     let mut account = load_account(account_id)?;
 
@@ -1329,10 +1332,8 @@ pub fn find_account_id_by_email(email: &str) -> Option<String> {
         .map(|a| a.id)
 }
 
-pub fn mark_account_forbidden(account_id: &str, reason: &str) -> Result<(), String> {
-    let _lock = ACCOUNT_INDEX_LOCK
-        .lock()
-        .map_err(|e| format!("failed_to_acquire_lock: {}", e))?;
+pub async fn mark_account_forbidden(account_id: &str, reason: &str) -> Result<(), String> {
+    let _lock = ACCOUNT_INDEX_LOCK.lock().await;
 
     let mut account = load_account(account_id)?;
 
@@ -1446,7 +1447,7 @@ pub async fn fetch_quota_with_retry(account: &mut Account) -> crate::error::AppR
         };
 
         account.name = name.clone();
-        upsert_account(account.email.clone(), name, token.clone()).map_err(AppError::Account)?;
+        upsert_account(account.email.clone(), name, token.clone()).await.map_err(AppError::Account)?;
     }
 
     // 0. Supplement display name (if missing or upper step failed)
@@ -1466,7 +1467,7 @@ pub async fn fetch_quota_with_retry(account: &mut Account) -> crate::error::AppR
                 account.name = display_name.clone();
                 // Save immediately
                 if let Err(e) =
-                    upsert_account(account.email.clone(), display_name, account.token.clone())
+                    upsert_account(account.email.clone(), display_name, account.token.clone()).await
                 {
                     modules::logger::log_warn(&format!("Failed to save display name: {}", e));
                 }
@@ -1493,7 +1494,7 @@ pub async fn fetch_quota_with_retry(account: &mut Account) -> crate::error::AppR
                 account.email.clone(),
                 account.name.clone(),
                 account.token.clone(),
-            ) {
+            ).await {
                 modules::logger::log_warn(&format!("Failed to sync project_id: {}", e));
             }
         }
@@ -1553,6 +1554,7 @@ pub async fn fetch_quota_with_retry(account: &mut Account) -> crate::error::AppR
                 account.token = new_token.clone();
                 account.name = name.clone();
                 upsert_account(account.email.clone(), name, new_token.clone())
+                    .await
                     .map_err(AppError::Account)?;
 
                 // Retry query
@@ -1571,7 +1573,7 @@ pub async fn fetch_quota_with_retry(account: &mut Account) -> crate::error::AppR
                             account.email.clone(),
                             account.name.clone(),
                             account.token.clone(),
-                        );
+                        ).await;
                     }
                 }
 
@@ -1645,7 +1647,7 @@ pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
                 crate::modules::logger::log_info(&format!("  - Processing {}", email));
                 match fetch_quota_with_retry(&mut account).await {
                     Ok(quota) => {
-                        if let Err(e) = update_account_quota(&account_id, quota) {
+                        if let Err(e) = update_account_quota(&account_id, quota).await {
                             let msg = format!("Account {}: Save quota failed - {}", email, e);
                             crate::modules::logger::log_error(&msg);
                             Err(msg)

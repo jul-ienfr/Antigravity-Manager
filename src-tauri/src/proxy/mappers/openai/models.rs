@@ -43,6 +43,9 @@ pub struct OpenAIRequest {
     // [NEW] Direct imageSize support (for Gemini native parameter)
     #[serde(default, rename = "imageSize")]
     pub image_size: Option<String>,
+    // [NEW] stream_options support
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
 }
 
 /// Thinking 配置 (兼容 Anthropic 和 OpenAI 扩展协议)
@@ -54,6 +57,12 @@ pub struct ThinkingConfig {
     pub budget_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>, // "low", "high", or "max"
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
 }
 
 
@@ -78,6 +87,20 @@ pub enum OpenAIContentBlock {
     ImageUrl { image_url: OpenAIImageUrl },
     #[serde(rename = "audio_url")]
     AudioUrl { audio_url: AudioUrlContent },
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        tool_use_id: String,
+        content: Option<serde_json::Value>,
+    },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    // Allows skipping unknown block types like tool_result if not perfectly matched above
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

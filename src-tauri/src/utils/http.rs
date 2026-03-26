@@ -19,7 +19,7 @@ pub static SHARED_STANDARD_CLIENT_LONG: Lazy<Client> = Lazy::new(|| create_stand
 /// Base client creation logic with JA3 Emulation
 fn create_base_client(timeout_secs: u64) -> Client {
     let mut builder = Client::builder()
-        .emulation(Emulation::Chrome123)
+        .emulation(Emulation::Chrome136)
         .timeout(std::time::Duration::from_secs(timeout_secs));
 
     if let Ok(config) = load_app_config() {
@@ -40,7 +40,7 @@ fn create_base_client(timeout_secs: u64) -> Client {
         }
     }
 
-    tracing::info!("Initialized JA3/TLS Impersonation (Chrome123)");
+    tracing::info!("Initialized JA3/TLS Impersonation (Chrome136)");
     builder.build().unwrap_or_else(|_| Client::new())
 }
 
@@ -57,7 +57,7 @@ pub fn get_long_client() -> Client {
 /// Base client creation logic strictly WITHOUT JA3 Emulation (Pure Native)
 fn create_standard_client(timeout_secs: u64) -> Client {
     let mut builder = Client::builder()
-        // No .emulation(Emulation::Chrome123) here!
+        // No .emulation(Emulation::Chrome136) here!
         .timeout(std::time::Duration::from_secs(timeout_secs));
 
     if let Ok(config) = load_app_config() {

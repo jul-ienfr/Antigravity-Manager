@@ -11,6 +11,24 @@ use serde_json::Value;
 use crate::proxy::middleware::auth::UserTokenIdentity;
 use futures::StreamExt;
 
+#[derive(Clone, Copy, Debug)]
+pub struct QueueDuration(pub u64);
+
+struct ActiveRequestGuard {
+    monitor: std::sync::Arc<crate::proxy::monitor::ProxyMonitor>,
+    request_id: String,
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        let monitor = self.monitor.clone();
+        let id = self.request_id.clone();
+        tokio::spawn(async move {
+            monitor.remove_active_request(&id).await;
+        });
+    }
+}
+
 const MAX_REQUEST_LOG_SIZE: usize = 100 * 1024 * 1024; // 100MB
 const MAX_RESPONSE_LOG_SIZE: usize = 100 * 1024 * 1024; // 100MB for image responses
 
@@ -63,6 +81,11 @@ pub async fn monitor_middleware(
                 .get("x-real-ip")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string())
+        })
+        .or_else(|| {
+            request.extensions()
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|axum::extract::ConnectInfo(addr)| addr.ip().to_string())
         });
         
     let user_agent = request
@@ -112,7 +135,53 @@ pub async fn monitor_middleware(
         request
     };
     
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    
+    let protocol_early = if uri.contains("/v1/messages") {
+        Some("anthropic".to_string())
+    } else if uri.contains("/v1beta/models") {
+        Some("gemini".to_string())
+    } else if uri.starts_with("/v1/") {
+        Some("openai".to_string())
+    } else {
+        None
+    };
+
+    let pending_log = ProxyRequestLog {
+        id: request_id.clone(),
+        timestamp,
+        method: method.clone(),
+        url: uri.clone(),
+        status: 0,
+        duration: 0,
+        model: model.clone(),
+        mapped_model: None,
+        account_email: None,
+        client_ip: client_ip.clone(),
+        error: None,
+        request_body: None,
+        response_body: None,
+        input_tokens: None,
+        output_tokens: None,
+        protocol: protocol_early,
+        username: user_token_identity.as_ref().map(|identity| identity.username.clone()),
+        user_agent: user_agent.clone(),
+        queue_duration: None,
+    };
+    
+    state.monitor.add_active_request(pending_log).await;
+
+    // Use a Drop guard to enforce removal of the active request from the pending queue
+    // even if the client disconnects and this Future is abruptly dropped.
+    let _active_guard = ActiveRequestGuard {
+        monitor: state.monitor.clone(),
+        request_id: request_id.clone(),
+    };
+
     let response = next.run(request).await;
+
+    let queue_duration = response.extensions().get::<QueueDuration>().copied().map(|q| q.0);
     
     // user_token_identity 已在上面从请求 extensions 中提取
     
@@ -156,8 +225,8 @@ pub async fn monitor_middleware(
 
     let monitor = state.monitor.clone();
     let mut log = ProxyRequestLog {
-        id: uuid::Uuid::new_v4().to_string(),
-        timestamp: chrono::Utc::now().timestamp_millis(),
+        id: request_id,
+        timestamp,
         method,
         url: uri,
         status,
@@ -173,6 +242,8 @@ pub async fn monitor_middleware(
         output_tokens: None,
         protocol,
         username,
+        user_agent: user_agent.clone(),
+        queue_duration,
     };
 
 
@@ -312,6 +383,16 @@ pub async fn monitor_middleware(
                                             log.output_tokens = Some(output_tokens as u32);
                                         }
                                     }
+                                }
+                            }
+                            Some("response.output_text.delta") => {
+                                if let Some(delta) = json.get("delta").and_then(|v| v.as_str()) {
+                                    response_content.push_str(delta);
+                                }
+                            }
+                            Some("response.reasoning.delta") => {
+                                if let Some(delta) = json.get("delta").and_then(|v| v.as_str()) {
+                                    thinking_content.push_str(delta);
                                 }
                             }
                             _ => {}

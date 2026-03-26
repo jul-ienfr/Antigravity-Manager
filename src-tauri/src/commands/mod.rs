@@ -15,6 +15,8 @@ pub mod security;
 pub mod proxy_pool;
 // 导出 user_token 命令
 pub mod user_token;
+// 导出 launcher 命令
+pub mod launcher;
 
 /// 列出所有账号
 #[tauri::command]
@@ -58,7 +60,7 @@ pub async fn delete_account(
     let service = modules::account_service::AccountService::new(
         crate::modules::integration::SystemManager::Desktop(app.clone()),
     );
-    service.delete_account(&account_id)?;
+    service.delete_account(&account_id).await?;
 
     // Reload token pool
     let _ = crate::commands::proxy::reload_proxy_accounts(proxy_state).await;
@@ -77,7 +79,7 @@ pub async fn delete_accounts(
         "收到批量删除请求，共 {} 个账号",
         account_ids.len()
     ));
-    modules::account::delete_accounts(&account_ids).map_err(|e| {
+    modules::account::delete_accounts(&account_ids).await.map_err(|e| {
         modules::logger::log_error(&format!("批量删除失败: {}", e));
         e
     })?;
@@ -102,7 +104,7 @@ pub async fn reorder_accounts(
         "收到账号重排序请求，共 {} 个账号",
         account_ids.len()
     ));
-    modules::account::reorder_accounts(&account_ids).map_err(|e| {
+    modules::account::reorder_accounts(&account_ids).await.map_err(|e| {
         modules::logger::log_error(&format!("账号重排序失败: {}", e));
         e
     })?;
@@ -171,7 +173,7 @@ async fn internal_refresh_account_quota(
     match modules::account::fetch_quota_with_retry(account).await {
         Ok(quota) => {
             // 更新账号配额
-            let _ = modules::update_account_quota(&account.id, quota.clone());
+            let _ = modules::update_account_quota(&account.id, quota.clone()).await;
             // 更新托盘菜单
             crate::modules::tray::update_tray_menus(app);
             Ok(quota)
@@ -199,6 +201,7 @@ pub async fn fetch_account_quota(
 
     // 4. 更新账号配额
     modules::update_account_quota(&account_id, quota.clone())
+        .await
         .map_err(crate::error::AppError::Account)?;
 
     crate::modules::tray::update_tray_menus(&app);
@@ -376,6 +379,8 @@ pub async fn save_config(
         crate::proxy::update_global_system_prompt_config(config.proxy.global_system_prompt.clone());
         // [NEW] 更新全局图像思维模式配置
         crate::proxy::update_image_thinking_mode(config.proxy.image_thinking_mode.clone());
+        // [NEW] 热更新 Hacker 配置
+        crate::proxy::config::update_hacker_config(config.proxy.hacker.clone());
         // 更新代理池配置
         instance
             .axum_server
@@ -395,13 +400,13 @@ pub async fn save_config(
 // --- OAuth 命令 ---
 
 #[tauri::command]
-pub async fn start_oauth_login(app_handle: tauri::AppHandle) -> Result<Account, String> {
+pub async fn start_oauth_login(app_handle: tauri::AppHandle, oauth_client_key: Option<String>) -> Result<Account, String> {
     modules::logger::log_info("开始 OAuth 授权流程...");
     let service = modules::account_service::AccountService::new(
         crate::modules::integration::SystemManager::Desktop(app_handle.clone()),
     );
 
-    let mut account = service.start_oauth_login().await?;
+    let mut account = service.start_oauth_login(oauth_client_key).await?;
 
     // 自动触发刷新额度
     let _ = internal_refresh_account_quota(&app_handle, &mut account).await;
@@ -439,11 +444,11 @@ pub async fn complete_oauth_login(app_handle: tauri::AppHandle) -> Result<Accoun
 
 /// 预生成 OAuth 授权链接 (不打开浏览器)
 #[tauri::command]
-pub async fn prepare_oauth_url(app_handle: tauri::AppHandle) -> Result<String, String> {
+pub async fn prepare_oauth_url(app_handle: tauri::AppHandle, oauth_client_key: Option<String>) -> Result<String, String> {
     let service = modules::account_service::AccountService::new(
         crate::modules::integration::SystemManager::Desktop(app_handle.clone()),
     );
-    service.prepare_oauth_url().await
+    service.prepare_oauth_url(oauth_client_key).await
 }
 
 #[tauri::command]
@@ -457,6 +462,24 @@ pub async fn cancel_oauth_login() -> Result<(), String> {
 pub async fn submit_oauth_code(code: String, state: Option<String>) -> Result<(), String> {
     modules::logger::log_info("收到手动提交 OAuth Code 请求");
     modules::oauth_server::submit_oauth_code(code, state).await
+}
+
+/// 列出可用的 OAuth 客户端
+#[tauri::command]
+pub async fn list_oauth_clients() -> Result<Vec<crate::modules::oauth::OAuthClientDescriptor>, String> {
+    crate::modules::oauth::list_oauth_clients()
+}
+
+/// 获取当前活跃的 OAuth 客户端 key
+#[tauri::command]
+pub async fn get_active_oauth_client() -> Result<String, String> {
+    crate::modules::oauth::get_active_oauth_client_key()
+}
+
+/// 切换活跃的 OAuth 客户端
+#[tauri::command]
+pub async fn set_active_oauth_client(client_key: String) -> Result<(), String> {
+    crate::modules::oauth::set_active_oauth_client_key(&client_key)
 }
 
 // --- 导入命令 ---
@@ -489,7 +512,7 @@ pub async fn import_from_db(
 
     // 既然是从数据库导入（即 IDE 当前账号），自动将其设为 Manager 的当前账号
     let account_id = account.id.clone();
-    modules::account::set_current_account_id(&account_id)?;
+    modules::account::set_current_account_id(&account_id).await?;
 
     // 自动触发刷新额度
     let _ = internal_refresh_account_quota(&app, &mut account).await;
@@ -515,7 +538,7 @@ pub async fn import_custom_db(
 
     // 自动设为当前账号
     let account_id = account.id.clone();
-    modules::account::set_current_account_id(&account_id)?;
+    modules::account::set_current_account_id(&account_id).await?;
 
     // 自动触发刷新额度
     let _ = internal_refresh_account_quota(&app, &mut account).await;
@@ -724,10 +747,9 @@ pub async fn get_antigravity_args() -> Result<Vec<String>, String> {
 /// 检测更新响应结构
 pub use crate::modules::update_checker::UpdateInfo;
 
-/// 检测 GitHub releases 更新
 #[tauri::command]
-pub async fn check_for_updates() -> Result<UpdateInfo, String> {
-    modules::logger::log_info("收到前端触发的更新检查请求");
+pub async fn check_for_updates() -> Result<crate::modules::update_checker::UpdateInfo, String> {
+    crate::modules::logger::log_info("收到前端触发的更新检查请求");
     crate::modules::update_checker::check_for_updates().await
 }
 
@@ -864,16 +886,29 @@ pub async fn toggle_proxy_status(
     Ok(())
 }
 
-/// 预热所有可用账号
-#[tauri::command]
-pub async fn warm_up_all_accounts() -> Result<String, String> {
-    modules::quota::warm_up_all_accounts().await
-}
-
 /// 预热指定账号
 #[tauri::command]
-pub async fn warm_up_account(account_id: String) -> Result<String, String> {
+pub async fn warm_up_account(
+    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
+    account_id: String
+) -> Result<String, String> {
+    let instance_lock = proxy_state.instance.read().await;
+    if let Some(instance) = instance_lock.as_ref() {
+        instance.token_manager.clear_model_not_found(&account_id);
+    }
     modules::quota::warm_up_account(&account_id).await
+}
+
+/// 预热所有可用账号
+#[tauri::command]
+pub async fn warm_up_all_accounts(
+    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
+) -> Result<String, String> {
+    let instance_lock = proxy_state.instance.read().await;
+    if let Some(instance) = instance_lock.as_ref() {
+        instance.token_manager.clear_all_model_not_found();
+    }
+    modules::quota::warm_up_all_accounts().await
 }
 
 /// 更新账号自定义标签
@@ -1013,4 +1048,9 @@ pub async fn get_token_stats_account_trend_daily(
     days: i64,
 ) -> Result<Vec<crate::modules::token_stats::AccountTrendPoint>, String> {
     crate::modules::token_stats::get_account_trend_daily(days)
+}
+
+#[tauri::command]
+pub async fn get_current_rpm() -> Result<crate::modules::token_stats::RpmData, String> {
+    crate::modules::token_stats::get_current_rpm()
 }

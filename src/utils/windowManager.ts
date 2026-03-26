@@ -40,7 +40,7 @@ export const exitMiniMode = async () => {
     try {
         const win = getCurrentWindow();
         // Restore to a reasonable default size
-        await win.setSize(new LogicalSize(1200, 800));
+        await win.setSize(new LogicalSize(1250, 800));
         await win.setAlwaysOnTop(false);
         await win.center();
         // Restore window decorations (title bar)
@@ -63,7 +63,7 @@ export const ensureFullViewState = async () => {
         const size = await win.outerSize();
         // If window is suspiciously narrow (likely leftover from Mini View), restore default size
         if (size.width < 500) {
-            await win.setSize(new LogicalSize(1200, 800));
+            await win.setSize(new LogicalSize(1250, 800));
             await win.center();
         }
         // Always enforce standard window properties for Full View

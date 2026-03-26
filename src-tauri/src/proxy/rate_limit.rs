@@ -13,8 +13,18 @@ pub enum RateLimitReason {
     ModelCapacityExhausted,
     /// 服务器错误 (5xx)
     ServerError,
+    /// 模型未授权/未找到 (404)
+    ModelNotFound,
     /// 未知原因
     Unknown,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RateLimitStatus {
+    /// account_id -> unix timestamp ms
+    pub disabled_accounts: std::collections::HashMap<String, u64>,
+    /// account_id -> list of disabled models
+    pub disabled_models: std::collections::HashMap<String, Vec<String>>,
 }
 
 /// 限流信息
@@ -146,6 +156,42 @@ impl RateLimitTracker {
             );
         }
     }
+
+    /// Exposes the current status of all rate limits for the frontend
+    pub fn get_status(&self) -> RateLimitStatus {
+        let now = SystemTime::now();
+        let mut disabled_accounts = std::collections::HashMap::new();
+        let mut disabled_models: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+
+        for entry in self.limits.iter() {
+            let info = entry.value();
+            if info.reset_time > now {
+                let key = entry.key();
+                let ms_until = info.reset_time
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or(Duration::from_secs(0))
+                    .as_millis() as u64;
+
+                if let Some(model) = &info.model {
+                    // Extract account_id from "account_id:model_name"
+                    let suffix = format!(":{}", model);
+                    if let Some(account_id) = key.strip_suffix(&suffix) {
+                        disabled_models.entry(account_id.to_string()).or_default().push(model.clone());
+                    } else {
+                        // Fallback 
+                        disabled_models.entry(key.to_string()).or_default().push(model.clone());
+                    }
+                } else {
+                    disabled_accounts.insert(key.clone(), ms_until);
+                }
+            }
+        }
+
+        RateLimitStatus {
+            disabled_accounts,
+            disabled_models,
+        }
+    }
     
     /// 使用 ISO 8601 时间字符串精确锁定账号
     /// 
@@ -198,8 +244,8 @@ impl RateLimitTracker {
             tracing::warn!("Google 429 Error Body: {}", body);
             self.parse_rate_limit_reason(body)
         } else if status == 404 {
-            tracing::warn!("Google 404: model unavailable on this account, short lockout before rotation");
-            RateLimitReason::ServerError
+            tracing::warn!("Google 404: model unavailable on this account, applying 24h lockout");
+            RateLimitReason::ModelNotFound
         } else {
             RateLimitReason::ServerError
         };
@@ -226,9 +272,8 @@ impl RateLimitTracker {
             },
             None => {
                 // 获取连续失败次数，用于指数退避（带自动过期逻辑）
-                // [FIX] ServerError (5xx) 不累加 failure_count，避免污染 429 的退避阶梯
-                let failure_count = if reason != RateLimitReason::ServerError {
-                    // 只有非 ServerError 才累加失败计数（用于指数退避）
+                let failure_count = if reason != RateLimitReason::ServerError && reason != RateLimitReason::ModelNotFound {
+                    // 只有非 ServerError/ModelNotFound 才累加失败计数（用于指数退避）
                     let now = SystemTime::now();
                     // 这里我们使用 account_id 作为 key，不区分模型，
                     // 因为这里是为了计算连续"账号级"问题的退避。
@@ -281,8 +326,14 @@ impl RateLimitTracker {
                         lockout
                     },
                     RateLimitReason::ServerError => {
-                        let lockout = if status == 404 { 5 } else { 8 };
-                        tracing::warn!("检测到 {} 错误, 执行 {}s 软避让...", status, lockout);
+                        let lockout = 8;
+                        tracing::warn!("检测到 5xx 错误, 执行 {}s 软避让...", lockout);
+                        lockout
+                    },
+                    RateLimitReason::ModelNotFound => {
+                        // 模型不可用 (404)，封锁 24 小时
+                        let lockout = 86400; // 24 hours
+                        tracing::warn!("检测到 404 (Model Not Found) 错误, 封锁该模型 {}s", lockout);
                         lockout
                     },
                     RateLimitReason::Unknown => {
@@ -302,9 +353,9 @@ impl RateLimitTracker {
             model: model.clone(),
         };
         
-        // [FIX] 使用复合 Key 存储 (如果是 Quota 且有 Model)
-        // 只有 QuotaExhausted 适合做模型隔离，其他如 RateLimitExceeded 通常是全账号的 TPM
-        let use_model_key = matches!(reason, RateLimitReason::QuotaExhausted) && model.is_some();
+        // [FIX] 使用复合 Key 存储 (如果是 Quota 且有 Model，或是 404)
+        // 只有 QuotaExhausted 和 ModelNotFound 适合做模型隔离，其他如 RateLimitExceeded 通常是全账号的 TPM
+        let use_model_key = matches!(reason, RateLimitReason::QuotaExhausted | RateLimitReason::ModelNotFound) && model.is_some();
         let key = if use_model_key { 
             self.get_limit_key(account_id, model.as_deref())
         } else {
@@ -543,6 +594,31 @@ impl RateLimitTracker {
         }
         
         count
+    }
+    
+    /// 清除该账号下因 404 导致的临时模型禁用
+    pub fn clear_model_not_found(&self, account_id: &str) {
+        let prefix = format!("{}:", account_id);
+        self.limits.retain(|k, v| {
+            if k.starts_with(&prefix) && v.reason == RateLimitReason::ModelNotFound {
+                tracing::info!("🔄 释放被 404 禁用的模型: {}", k);
+                false // remove
+            } else {
+                true // keep
+            }
+        });
+    }
+
+    /// 清除所有因 404 导致的临时模型禁用 (供全局 Warmup 调用)
+    pub fn clear_all_model_not_found(&self) {
+        self.limits.retain(|k, v| {
+            if v.reason == RateLimitReason::ModelNotFound {
+                tracing::info!("🔄 [Warmup] 全局释放被 404 禁用的模型: {}", k);
+                false // remove
+            } else {
+                true // keep
+            }
+        });
     }
     
     /// 清除指定账号的限流记录

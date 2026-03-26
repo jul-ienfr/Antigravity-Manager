@@ -1,5 +1,5 @@
 import { save } from '@tauri-apps/plugin-dialog';
-import { AlertTriangle, ArrowRight, Bot, Download, RefreshCw, Sparkles, Users } from 'lucide-react';
+import { AlertTriangle, ArrowRight, Bot, Download, RefreshCw, Sparkles, Users, Rocket } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
@@ -181,6 +181,22 @@ function Dashboard() {
         exportAccountsToJson(accounts);
     };
 
+    const [isLaunching, setIsLaunching] = useState(false);
+    
+    const handleLaunchHacked = async () => {
+        if (isLaunching) return;
+        setIsLaunching(true);
+        try {
+            await invoke('launch_hacked_antigravity');
+            showToast(t('dashboard.launch_success'), 'success');
+        } catch (error) {
+            console.error('Erreur lancement:', error);
+            showToast(`${t('dashboard.launch_error')}: ${error}`, 'error');
+        } finally {
+            setIsLaunching(false);
+        }
+    };
+
     return (
         <div className="h-full w-full overflow-y-auto">
             <div
@@ -297,7 +313,7 @@ function Dashboard() {
                 </div>
 
                 {/* 快速链接 */}
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                     <button
                         className="bg-indigo-50 dark:bg-indigo-900/20 rounded-lg p-3 shadow-sm border border-indigo-100 dark:border-indigo-900/30 hover:border-indigo-300 dark:hover:border-indigo-700 hover:shadow-md transition-all flex items-center justify-between group"
                         onClick={() => navigate('/accounts')}
@@ -311,6 +327,16 @@ function Dashboard() {
                     >
                         <span className="text-purple-700 dark:text-purple-300 font-medium text-sm">{t('dashboard.export_data')}</span>
                         <Download className="w-4 h-4 text-purple-400 dark:text-purple-500 group-hover:text-purple-600 dark:group-hover:text-purple-300 transition-all" />
+                    </button>
+                    <button
+                        className="bg-red-50 dark:bg-red-900/20 rounded-lg p-3 shadow-sm border border-red-500 hover:bg-red-100 dark:hover:bg-red-900/40 hover:shadow-md transition-all flex items-center justify-between group"
+                        onClick={handleLaunchHacked}
+                        disabled={isLaunching}
+                    >
+                        <span className="text-red-700 dark:text-red-400 font-bold text-sm">
+                            {isLaunching ? t('dashboard.launching') : t('dashboard.launch_hacked')}
+                        </span>
+                        <Rocket className={`w-4 h-4 text-red-500 dark:text-red-400 ${isLaunching ? 'animate-bounce' : 'group-hover:translate-x-1'} transition-all`} />
                     </button>
                 </div>
             </div>

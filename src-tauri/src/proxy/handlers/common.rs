@@ -3,6 +3,15 @@ use tracing::{debug, info};
 use axum::{http::StatusCode, response::{IntoResponse, Response}, Json, extract::State};
 use serde_json::{json, Value};
 use crate::proxy::server::AppState;
+use crate::proxy::monitor::ProxyRequestLog;
+
+pub async fn handle_smart_wrapper_log(
+    State(state): State<AppState>,
+    Json(log): Json<ProxyRequestLog>,
+) -> Response {
+    state.monitor.log_request(log).await;
+    StatusCode::OK.into_response()
+}
 
 // ===== 统一重试与退避策略 =====
 

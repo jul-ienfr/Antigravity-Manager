@@ -35,14 +35,33 @@ fn save_warmup_history(history: &HashMap<String, i64>) {
     }
 }
 
-pub fn record_warmup_history(key: &str, timestamp: i64) {
-    let mut history = WARMUP_HISTORY.lock().unwrap();
-    history.insert(key.to_string(), timestamp);
-    save_warmup_history(&history);
+pub async fn record_warmup_history(key: &str, timestamp: i64) {
+    let history_snapshot = {
+        let mut guard = match WARMUP_HISTORY.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("[SECURITY] Mutex empoisonné ignoré. Overide activé.");
+                poisoned.into_inner()
+            }
+        };
+        guard.insert(key.to_string(), timestamp);
+        guard.clone()
+    };
+    if let Ok(path) = get_warmup_history_path() {
+        if let Ok(content) = serde_json::to_string_pretty(&history_snapshot) {
+            let _ = tokio::fs::write(&path, content).await;
+        }
+    }
 }
 
 pub fn check_cooldown(key: &str, cooldown_seconds: i64) -> bool {
-    let history = WARMUP_HISTORY.lock().unwrap();
+    let history = match WARMUP_HISTORY.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!("[SECURITY] Mutex empoisonné ignoré. Overide activé.");
+            poisoned.into_inner()
+        }
+    };
     if let Some(&last_ts) = history.get(key) {
         let now = chrono::Utc::now().timestamp();
         now - last_ts < cooldown_seconds
@@ -106,7 +125,7 @@ pub fn start_scheduler(app_handle: Option<tauri::AppHandle>, proxy_state: crate:
                         "[Scheduler] Account {} returned 403 Forbidden during quota fetch, marking as forbidden",
                         account.email
                     ));
-                    let _ = account::mark_account_forbidden(&account.id, "Scheduler: 403 Forbidden - quota fetch denied");
+                    let _ = account::mark_account_forbidden(&account.id, "Scheduler: 403 Forbidden - quota fetch denied").await;
                     continue;
                 }
 
@@ -127,7 +146,13 @@ pub fn start_scheduler(app_handle: Option<tauri::AppHandle>, proxy_state: crate:
                         
                         // Check cooldown: do not repeat warmup within 4 hours
                         {
-                            let history = WARMUP_HISTORY.lock().unwrap();
+                            let history = match WARMUP_HISTORY.lock() {
+                                Ok(guard) => guard,
+                                Err(poisoned) => {
+                                    tracing::warn!("[SECURITY] Mutex empoisonné ignoré. Overide activé.");
+                                    poisoned.into_inner()
+                                }
+                            };
                             if let Some(&last_warmup_ts) = history.get(&history_key) {
                                 let cooldown_seconds = 14400;
                                 if now_ts - last_warmup_ts < cooldown_seconds {
@@ -156,9 +181,26 @@ pub fn start_scheduler(app_handle: Option<tauri::AppHandle>, proxy_state: crate:
                         let model_to_ping = model.name.clone();
                         let history_key = format!("{}:{}:100", account.email, model_to_ping);
                         
-                        let mut history = WARMUP_HISTORY.lock().unwrap();
-                        if history.remove(&history_key).is_some() {
-                            save_warmup_history(&history);
+                        let mut history_snapshot = None;
+                        {
+                            let mut history = match WARMUP_HISTORY.lock() {
+                                Ok(guard) => guard,
+                                Err(poisoned) => {
+                                    tracing::warn!("[SECURITY] Mutex empoisonné ignoré. Overide activé.");
+                                    poisoned.into_inner()
+                                }
+                            };
+                            if history.remove(&history_key).is_some() {
+                                history_snapshot = Some(history.clone());
+                            }
+                        }
+                        
+                        if let Some(snapshot) = history_snapshot {
+                            if let Ok(path) = get_warmup_history_path() {
+                                if let Ok(content) = serde_json::to_string_pretty(&snapshot) {
+                                    let _ = tokio::fs::write(&path, content).await;
+                                }
+                            }
                             logger::log_info(&format!(
                                 "[Scheduler] Cleared history for {} @ {} (quota: {}%)",
                                 model_to_ping, account.email, model.percentage
@@ -219,7 +261,7 @@ pub fn start_scheduler(app_handle: Option<tauri::AppHandle>, proxy_state: crate:
                             match handle.await {
                                 Ok((true, history_key)) => {
                                     success += 1;
-                                    record_warmup_history(&history_key, now_ts);
+                                    record_warmup_history(&history_key, now_ts).await;
                                 }
                                 _ => {}
                             }
@@ -262,7 +304,13 @@ pub fn start_scheduler(app_handle: Option<tauri::AppHandle>, proxy_state: crate:
             // Regularly clean up history (keep last 24 hours)
             {
                 let now_ts = Utc::now().timestamp();
-                let mut history = WARMUP_HISTORY.lock().unwrap();
+                let mut history = match WARMUP_HISTORY.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        tracing::warn!("[SECURITY] Mutex empoisonné ignoré. Overide activé.");
+                        poisoned.into_inner()
+                    }
+                };
                 let cutoff = now_ts - 86400; // 24 hours ago
                 history.retain(|_, &mut ts| ts > cutoff);
             }
@@ -289,7 +337,7 @@ pub async fn trigger_warmup_for_account(account: &Account) {
             "[Scheduler] Account {} returned 403 Forbidden during quota fetch, marking as forbidden",
             account.email
         ));
-        let _ = account::mark_account_forbidden(&account.id, "Scheduler: 403 Forbidden - quota fetch denied");
+        let _ = account::mark_account_forbidden(&account.id, "Scheduler: 403 Forbidden - quota fetch denied").await;
         return;
     }
 
@@ -314,7 +362,13 @@ pub async fn trigger_warmup_for_account(account: &Account) {
 
             // Then check cooldown history
             {
-                let history = WARMUP_HISTORY.lock().unwrap();
+                let history = match WARMUP_HISTORY.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        tracing::warn!("[SECURITY] Mutex empoisonné ignoré. Overide activé.");
+                        poisoned.into_inner()
+                    }
+                };
 
                 // 4 hour cooldown (Pro account resets every 5h, 1h margin)
                 if let Some(&last_warmup_ts) = history.get(&history_key) {
@@ -330,9 +384,25 @@ pub async fn trigger_warmup_for_account(account: &Account) {
             tasks_to_run.push((model_name, model.percentage, history_key));
         } else if model.percentage < 100 {
             // Quota not full, clear history, allow warmup next time it's 100%
-            let mut history = WARMUP_HISTORY.lock().unwrap();
-            if history.remove(&history_key).is_some() {
-                save_warmup_history(&history);
+            let mut history_snapshot = None;
+            {
+                let mut history = match WARMUP_HISTORY.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        tracing::warn!("[SECURITY] Mutex empoisonné ignoré. Overide activé.");
+                        poisoned.into_inner()
+                    }
+                };
+                if history.remove(&history_key).is_some() {
+                    history_snapshot = Some(history.clone());
+                }
+            }
+            if let Some(snapshot) = history_snapshot {
+                if let Ok(path) = get_warmup_history_path() {
+                    if let Ok(content) = serde_json::to_string_pretty(&snapshot) {
+                        let _ = tokio::fs::write(&path, content).await;
+                    }
+                }
             }
         }
     }
@@ -354,7 +424,7 @@ pub async fn trigger_warmup_for_account(account: &Account) {
 
             // Only record history if warmup was successful
             if success {
-                record_warmup_history(&history_key, now_ts);
+                record_warmup_history(&history_key, now_ts).await;
             }
         }
     }

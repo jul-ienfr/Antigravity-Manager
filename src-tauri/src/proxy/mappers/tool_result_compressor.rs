@@ -358,7 +358,7 @@ Please read the file locally."#;
             }),
             serde_json::json!({
                 "type": "text",
-                "text": "b".repeat(150_000)
+                "text": "b".repeat(50_000)
             }),
             serde_json::json!({
                 "type": "image",

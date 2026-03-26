@@ -164,8 +164,7 @@ pub async fn import_from_v1() -> Result<Vec<Account>, String> {
                             None, // session_id
                     );
                         
-                        // Name already fetched in get_user_info at line 153, but outside match scope, use None to be safe
-                        match account::upsert_account(email.clone(), None, token_data) {
+                        match account::upsert_account(email.clone(), None, token_data).await {
                             Ok(acc) => {
                                 crate::modules::logger::log_info(&format!("Import successful: {}", email));
                                 imported_accounts.push(acc);
@@ -218,7 +217,7 @@ pub async fn import_from_custom_db_path(path_str: String) -> Result<Account, Str
     );
     
     // 4. Add or update account
-    account::upsert_account(email.clone(), user_info.name, token_data)
+    account::upsert_account(email.clone(), user_info.name, token_data).await
 }
 
 /// Import current logged-in account from default IDE database

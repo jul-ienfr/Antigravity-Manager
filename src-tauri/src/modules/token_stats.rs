@@ -553,6 +553,36 @@ pub fn get_account_trend_daily(days: i64) -> Result<Vec<AccountTrendPoint>, Stri
         .collect())
 }
 
+/// RPM Data container
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpmData {
+    pub global_rpm: u32,
+    pub global_tpm: u32,
+    pub account_rpms: std::collections::HashMap<String, u32>,
+    pub account_tpms: std::collections::HashMap<String, u32>,
+}
+
+/// Get the number of requests in the last 60 seconds (Global and per account)
+pub fn get_current_rpm() -> Result<RpmData, String> {
+    let tracker = &crate::proxy::usage_tracker::USAGE_TRACKER;
+
+    let mut account_rpms = std::collections::HashMap::new();
+    let mut account_tpms = std::collections::HashMap::new();
+
+    for entry in tracker.accounts.iter() {
+        let email = entry.key().clone();
+        account_rpms.insert(email.clone(), entry.value().rpm.get_total());
+        account_tpms.insert(email, entry.value().tpm.get_total());
+    }
+
+    Ok(RpmData {
+        global_rpm: tracker.get_global_rpm(),
+        global_tpm: tracker.get_global_tpm(),
+        account_rpms,
+        account_tpms,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

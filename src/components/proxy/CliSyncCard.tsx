@@ -23,6 +23,7 @@ import ModalDialog from '../common/ModalDialog';
 import { cn } from '../../utils/cn';
 import { DroidSyncModal } from './DroidSyncModal';
 import { OpenCodeSyncModal } from './OpenCodeSyncModal';
+import { ClaudeSyncModal } from './ClaudeSyncModal';
 import { useProxyModels } from '../../hooks/useProxyModels';
 import GroupedSelect from '../common/GroupedSelect';
 
@@ -85,6 +86,7 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
     const [restoreConfirmApp, setRestoreConfirmApp] = useState<CliAppType | null>(null);
     const [syncConfirmApp, setSyncConfirmApp] = useState<CliAppType | null>(null);
     const [openCodeSyncModal, setOpenCodeSyncModal] = useState(false);
+    const [claudeSyncModal, setClaudeSyncModal] = useState(false);
     const [clearConfirmApp, setClearConfirmApp] = useState<CliAppType | null>(null);
 
     const { models: proxyModels } = useProxyModels();
@@ -140,6 +142,10 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
         }
         if (app === 'OpenCode') {
             setOpenCodeSyncModal(true);
+            return;
+        }
+        if (app === 'Claude') {
+            setClaudeSyncModal(true);
             return;
         }
         setSyncConfirmApp(app);
@@ -318,8 +324,8 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
                         </div>
                     </div>
 
-                    {/* Claude, Codex, Gemini 的模型选择 */}
-                    {(status?.installed || app === 'OpenCode') && (app === 'Claude' || app === 'Codex' || app === 'Gemini') && (
+                    {/* Codex, Gemini 的模型选择 */}
+                    {(status?.installed || app === 'OpenCode') && (app === 'Codex' || app === 'Gemini') && (
                         <div className="space-y-1">
                             <div className="text-[9px] text-gray-400 dark:text-gray-500 uppercase font-bold tracking-wider px-1">
                                 {t('proxy.cli_sync.model_select', { defaultValue: 'Select Model' })}
@@ -539,6 +545,16 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
                     getFormattedProxyUrl={getFormattedProxyUrl}
                     onClose={() => setOpenCodeSyncModal(false)}
                     onSyncDone={() => checkStatus('OpenCode')}
+                />
+            )}
+            {/* Claude 模型选择弹窗 */}
+            {claudeSyncModal && (
+                <ClaudeSyncModal
+                    proxyUrl={proxyUrl}
+                    apiKey={apiKey}
+                    getFormattedProxyUrl={getFormattedProxyUrl}
+                    onClose={() => setClaudeSyncModal(false)}
+                    onSyncDone={() => checkStatus('Claude')}
                 />
             )}
         </div>

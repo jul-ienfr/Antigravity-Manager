@@ -25,6 +25,42 @@ export interface ProxyConfig {
     global_system_prompt?: GlobalSystemPromptConfig;
     image_thinking_mode?: 'enabled' | 'disabled'; // [NEW] 图像思维模式开关
     proxy_pool?: ProxyPoolConfig;
+    hacker: HackerConfig;
+    predictive_limits?: PredictiveDistributionConfig;
+}
+
+export type PredictiveQueueMode = 'queue' | 'reject';
+
+export type TierLimitMode = 'auto' | 'manual';
+
+export interface TierLimitConfig {
+    mode: TierLimitMode;
+    rpm_limit: number;
+    tpm_limit: number;
+}
+
+export interface PredictiveDistributionConfig {
+    enabled: boolean;
+    mode: PredictiveQueueMode;
+    tpm_limit: number; // Legacy
+    rpm_limit: number; // Legacy
+    free_tier?: TierLimitConfig;
+    pro_tier?: TierLimitConfig;
+    ultra_tier?: TierLimitConfig;
+}
+
+export interface HackerConfig {
+    enable_advanced_stealth: boolean;
+    enable_amnesia: boolean;
+    enable_god_mode: boolean;
+    enable_time_travel: boolean;
+    enable_shadow_ban_bypass: boolean;
+    enable_anti_censor: boolean;
+    enable_auto_retry: boolean;
+    enable_auto_accept: boolean;
+    enable_auto_hook: boolean;
+    enable_auto_harvest: boolean;
+    enable_context_inception: boolean;
 }
 
 // ============================================================================

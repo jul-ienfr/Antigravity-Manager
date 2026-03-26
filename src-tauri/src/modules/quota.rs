@@ -1,3 +1,4 @@
+use rand::Rng;
 use rquest;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -445,6 +446,10 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
             for account in batch {
                 let account = account.clone();
                 let handle = tokio::spawn(async move {
+                    // [ANTI-BOT JITTER] Délai aléatoire entre 500ms et 2500ms avant d'interroger Google
+                    let jitter = rand::thread_rng().gen_range(500..2500);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(jitter)).await;
+
                     let (token, pid) = match get_valid_token_for_warmup(&account).await {
                         Ok(t) => t,
                         Err(_) => return None,
@@ -463,7 +468,7 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
                             "[Warmup] Account {} returned 403 Forbidden during quota fetch, marking as forbidden",
                             email
                         ));
-                        let _ = crate::modules::account::mark_account_forbidden(&id, "Warmup: 403 Forbidden - quota fetch denied");
+                        let _ = crate::modules::account::mark_account_forbidden(&id, "Warmup: 403 Forbidden - quota fetch denied").await;
                         continue;
                     }
                     let mut account_warmed_series = std::collections::HashSet::new();
@@ -549,7 +554,9 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
                     }
                     
                     if batch_idx < (warmup_items.len() + batch_size - 1) / batch_size - 1 {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        // [ANTI-BOT JITTER] Attente chaotique entre 1.5s et 4s au lieu de 2s strictes
+                        let jitter = rand::thread_rng().gen_range(1500..4000);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(jitter)).await;
                     }
                 }
                 
@@ -593,7 +600,7 @@ pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
             email
         ));
         let reason = "Warmup: 403 Forbidden - quota fetch denied";
-        let _ = crate::modules::account::mark_account_forbidden(account_id, reason);
+        let _ = crate::modules::account::mark_account_forbidden(account_id, reason).await;
         return Err("Account is forbidden (403)".to_string());
     }
 
@@ -626,7 +633,10 @@ pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
                 let now_ts = chrono::Utc::now().timestamp();
                 crate::modules::scheduler::record_warmup_history(&history_key, now_ts);
             }
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            
+            // [ANTI-BOT JITTER] Variable randomized delay (300ms-1200ms) instead of fixed 1s
+            let jitter = rand::thread_rng().gen_range(300..1200);
+            tokio::time::sleep(tokio::time::Duration::from_millis(jitter)).await;
         }
         let _ = crate::modules::account::refresh_all_quotas_logic().await;
     });

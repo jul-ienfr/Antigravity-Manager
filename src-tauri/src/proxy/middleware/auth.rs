@@ -179,6 +179,11 @@ async fn auth_middleware_internal(
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string())
             })
+            .or_else(|| {
+                request.extensions()
+                    .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                    .map(|axum::extract::ConnectInfo(addr)| addr.ip().to_string())
+            })
             .unwrap_or_else(|| "127.0.0.1".to_string()); // Default fallback
 
         // 验证 Token

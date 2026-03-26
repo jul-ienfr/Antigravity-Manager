@@ -9,11 +9,12 @@ interface QuotaItemProps {
     percentage: number;
     resetTime?: string;
     isProtected?: boolean;
+    isUnavailable?: boolean;
     className?: string;
     Icon?: React.ComponentType<{ size?: number; className?: string }>;
 }
 
-export function QuotaItem({ label, percentage, resetTime, isProtected, className, Icon }: QuotaItemProps) {
+export function QuotaItem({ label, percentage, resetTime, isProtected, isUnavailable, className, Icon }: QuotaItemProps) {
     const { t } = useTranslation();
     const getBgColorClass = (p: number) => {
         const color = getQuotaColor(p);
@@ -80,11 +81,19 @@ export function QuotaItem({ label, percentage, resetTime, isProtected, className
                 </div>
 
                 {/* Percentage */}
-                <span className={cn("w-[28px] text-right font-bold transition-colors flex items-center justify-end gap-0.5 shrink-0", getTextColorClass(percentage))}>
-                    {isProtected && (
-                        <span title={t('accounts.quota_protected')}><Lock className="w-2.5 h-2.5 text-amber-500" /></span>
+                <span className={cn("w-[28px] text-right font-bold transition-colors flex items-center justify-end gap-0.5 shrink-0", isUnavailable ? "text-gray-400 dark:text-gray-500" : getTextColorClass(percentage))}>
+                    {isUnavailable ? (
+                        <span title={t('accounts.model_unavailable', { defaultValue: 'Model returned 404' })} className="flex items-center text-[9px] gap-0.5">
+                            404
+                        </span>
+                    ) : (
+                        <>
+                            {isProtected && (
+                                <span title={t('accounts.quota_protected')}><Lock className="w-2.5 h-2.5 text-amber-500" /></span>
+                            )}
+                            {percentage}%
+                        </>
                     )}
-                    {percentage}%
                 </span>
             </div>
         </div>

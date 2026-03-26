@@ -3,8 +3,9 @@ use serde_json::Value;
 /// 使用 Antigravity 的 loadCodeAssist API 获取 project_id
 /// 这是获取 cloudaicompanionProject 的正确方式
 pub async fn fetch_project_id(access_token: &str) -> Result<String, String> {
-    // 使用 Sandbox 环境，避免 Prod 环境的 429 错误
-    let url = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist";
+    // Use Prod endpoint — legitimate clients always hit Prod for loadCodeAssist.
+    // Using Sandbox here would create a behavioral anomaly detectable by Google.
+    let url = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
     
     let request_body = serde_json::json!({
         "metadata": {

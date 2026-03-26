@@ -4,6 +4,8 @@ import Layout from './components/layout/Layout';
 import Dashboard from './pages/Dashboard';
 import Accounts from './pages/Accounts';
 import Settings from './pages/Settings';
+import LiveSniffer from './pages/LiveSniffer';
+
 import ApiProxy from './pages/ApiProxy';
 import Monitor from './pages/Monitor';
 import TokenStats from './pages/TokenStats';
@@ -53,6 +55,10 @@ const router = createBrowserRouter([
       {
         path: 'security',
         element: <Security />,
+      },
+      {
+        path: 'live-sniffer',
+        element: <LiveSniffer />,
       },
       {
         path: 'settings',

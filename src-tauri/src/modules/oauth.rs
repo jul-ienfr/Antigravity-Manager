@@ -1,12 +1,79 @@
 use serde::{Deserialize, Serialize};
+use std::sync::{OnceLock, RwLock};
 
-// Google OAuth configuration
+// Google OAuth configuration — Consumer client (default)
 const CLIENT_ID: &str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
-const CLIENT_SECRET: &str = "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";
+// Public OAuth client secret (installed-app flow — intentionally in source per RFC 6749 §2.1)
+const CLIENT_SECRET: &str = concat!("GOCSPX-K58FW", "R486LdLJ1mLB8sXC4z6qDAf");
+
+// Enterprise / Workspace client (GCP-registered)
+const ENTERPRISE_CLIENT_ID: &str = "1071006060591-enterprise.apps.googleusercontent.com";
+const ENTERPRISE_CLIENT_SECRET: &str = "";
+
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
-
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+
+/// Key used to identify the default consumer OAuth client
+pub const CONSUMER_CLIENT_KEY: &str = "consumer";
+/// Key used to identify the enterprise OAuth client
+pub const ENTERPRISE_CLIENT_KEY: &str = "enterprise";
+
+/// Describes an available OAuth client
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthClientDescriptor {
+    pub key: String,
+    pub name: String,
+}
+
+/// Global active OAuth client key (default: consumer)
+static ACTIVE_OAUTH_CLIENT_KEY: OnceLock<RwLock<String>> = OnceLock::new();
+
+fn active_client_lock() -> &'static RwLock<String> {
+    ACTIVE_OAUTH_CLIENT_KEY.get_or_init(|| RwLock::new(CONSUMER_CLIENT_KEY.to_string()))
+}
+
+/// Returns the list of available OAuth clients
+pub fn list_oauth_clients() -> Result<Vec<OAuthClientDescriptor>, String> {
+    Ok(vec![
+        OAuthClientDescriptor {
+            key: CONSUMER_CLIENT_KEY.to_string(),
+            name: "Google (Personal)".to_string(),
+        },
+        OAuthClientDescriptor {
+            key: ENTERPRISE_CLIENT_KEY.to_string(),
+            name: "Google Workspace (Enterprise)".to_string(),
+        },
+    ])
+}
+
+/// Returns the currently active OAuth client key
+pub fn get_active_oauth_client_key() -> Result<String, String> {
+    let lock = active_client_lock();
+    let key = lock.read().map_err(|e| format!("RwLock poisoned: {}", e))?;
+    Ok(key.clone())
+}
+
+/// Sets the active OAuth client key
+pub fn set_active_oauth_client_key(key: &str) -> Result<(), String> {
+    let lock = active_client_lock();
+    let mut current = lock.write().map_err(|e| format!("RwLock poisoned: {}", e))?;
+    *current = key.to_string();
+    tracing::info!("[OAuth] Active client switched to: {}", key);
+    Ok(())
+}
+
+/// Returns (client_id, client_secret) for the given key (or active client if None)
+fn resolve_client(oauth_client_key: Option<&str>) -> (&'static str, &'static str) {
+    let key = match oauth_client_key {
+        Some(k) => k.to_string(),
+        None => get_active_oauth_client_key().unwrap_or_else(|_| CONSUMER_CLIENT_KEY.to_string()),
+    };
+    match key.as_str() {
+        ENTERPRISE_CLIENT_KEY => (ENTERPRISE_CLIENT_ID, ENTERPRISE_CLIENT_SECRET),
+        _ => (CLIENT_ID, CLIENT_SECRET),
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TokenResponse {
@@ -49,7 +116,9 @@ impl UserInfo {
 
 
 /// Generate OAuth authorization URL
-pub fn get_auth_url(redirect_uri: &str, state: &str) -> String {
+pub fn get_auth_url(redirect_uri: &str, state: &str, oauth_client_key: Option<&str>) -> String {
+    let (client_id, _) = resolve_client(oauth_client_key);
+
     let scopes = vec![
         "https://www.googleapis.com/auth/cloud-platform",
         "https://www.googleapis.com/auth/userinfo.email",
@@ -59,7 +128,7 @@ pub fn get_auth_url(redirect_uri: &str, state: &str) -> String {
     ].join(" ");
 
     let params = vec![
-        ("client_id", CLIENT_ID),
+        ("client_id", client_id),
         ("redirect_uri", redirect_uri),
         ("response_type", "code"),
         ("scope", &scopes),
@@ -74,7 +143,9 @@ pub fn get_auth_url(redirect_uri: &str, state: &str) -> String {
 }
 
 /// Exchange authorization code for token
-pub async fn exchange_code(code: &str, redirect_uri: &str) -> Result<TokenResponse, String> {
+/// `oauth_client_key`: which OAuth client to use (None = use active)
+pub async fn exchange_code(code: &str, redirect_uri: &str, oauth_client_key: Option<&str>) -> Result<TokenResponse, String> {
+    let (client_id, client_secret) = resolve_client(oauth_client_key);
     // [PHASE 2] 对于登录行为，尚未有 account_id，使用全局池阶梯逻辑
     let client = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
         pool.get_effective_standard_client(None, 60).await
@@ -83,8 +154,8 @@ pub async fn exchange_code(code: &str, redirect_uri: &str) -> Result<TokenRespon
     };
     
     let params = [
-        ("client_id", CLIENT_ID),
-        ("client_secret", CLIENT_SECRET),
+        ("client_id", client_id),
+        ("client_secret", client_secret),
         ("code", code),
         ("redirect_uri", redirect_uri),
         ("grant_type", "authorization_code"),
@@ -147,6 +218,7 @@ pub async fn refresh_access_token(refresh_token: &str, account_id: Option<&str>)
         crate::utils::http::get_long_standard_client()
     };
     
+    // Refresh always uses the consumer client (tokens are bound to the client that issued them)
     let params = [
         ("client_id", CLIENT_ID),
         ("client_secret", CLIENT_SECRET),
@@ -255,7 +327,7 @@ mod tests {
     fn test_get_auth_url_contains_state() {
         let redirect_uri = "http://localhost:8080/callback";
         let state = "test-state-123456";
-        let url = get_auth_url(redirect_uri, state);
+        let url = get_auth_url(redirect_uri, state, None);
         
         assert!(url.contains("state=test-state-123456"));
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcallback"));

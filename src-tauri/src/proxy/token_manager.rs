@@ -49,6 +49,7 @@ pub struct TokenManager {
     preferred_account_id: Arc<tokio::sync::RwLock<Option<String>>>, // [FIX #820] 优先使用的账号ID（固定账号模式）
     health_scores: Arc<DashMap<String, f32>>,                       // account_id -> health_score
     circuit_breaker_config: Arc<tokio::sync::RwLock<crate::models::CircuitBreakerConfig>>, // [NEW] 熔断配置缓存
+    predictive_config: Arc<tokio::sync::RwLock<crate::proxy::config::PredictiveDistributionConfig>>, // [NEW] 预见性分配配置缓存
     /// 支持优雅关闭时主动 abort 后台任务
     auto_cleanup_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     cancel_token: CancellationToken,
@@ -70,12 +71,32 @@ impl TokenManager {
             circuit_breaker_config: Arc::new(tokio::sync::RwLock::new(
                 crate::models::CircuitBreakerConfig::default(),
             )),
+            predictive_config: Arc::new(tokio::sync::RwLock::new(
+                crate::proxy::config::PredictiveDistributionConfig::default(),
+            )),
             auto_cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
             cancel_token: CancellationToken::new(),
         }
     }
 
     /// 启动限流记录自动清理后台任务（每15秒检查并清除过期记录）
+    pub fn clear_model_not_found(&self, account_id: &str) {
+        self.rate_limit_tracker.clear_model_not_found(account_id);
+    }
+
+    pub fn clear_all_model_not_found(&self) {
+        self.rate_limit_tracker.clear_all_model_not_found();
+    }
+
+    pub fn get_rate_limit_status(&self) -> crate::proxy::rate_limit::RateLimitStatus {
+        self.rate_limit_tracker.get_status()
+    }
+
+    pub async fn update_predictive_config(&self, config: crate::proxy::config::PredictiveDistributionConfig) {
+        let mut w = self.predictive_config.write().await;
+        *w = config;
+    }
+
     pub async fn start_auto_cleanup(&self) {
         let tracker = self.rate_limit_tracker.clone();
         let cancel = self.cancel_token.child_token();
@@ -1068,41 +1089,74 @@ impl TokenManager {
         session_id: Option<&str>,
         target_model: &str,
     ) -> Result<(String, String, String, String, u64), String> {
-        // [FIX] 检查并处理待重新加载的账号（配额保护同步）
-        let pending_reload = crate::proxy::server::take_pending_reload_accounts();
-        for account_id in pending_reload {
-            if let Err(e) = self.reload_account(&account_id).await {
-                tracing::warn!("[Quota] Failed to reload account {}: {}", account_id, e);
-            } else {
+        self.get_token_excluding(quota_group, force_rotate, session_id, target_model, None).await
+    }
+
+    /// Like get_token but guarantees that the given account IDs are never selected.
+    /// Used by handlers to immediately exclude accounts that returned 429, bypassing
+    /// async race conditions in mark_rate_limited_async propagation.
+    pub async fn get_token_excluding(
+        &self,
+        quota_group: &str,
+        force_rotate: bool,
+        session_id: Option<&str>,
+        target_model: &str,
+        exclude_account_ids: Option<&std::collections::HashSet<String>>,
+    ) -> Result<(String, String, String, String, u64), String> {
+        let mut retry_count = 0;
+        let max_queue_wait = 120; // 120s max queue wait
+
+        loop {
+            // [FIX] 检查并处理待重新加载的账号（配额保护同步）
+            let pending_reload = crate::proxy::server::take_pending_reload_accounts().await;
+            for account_id in pending_reload {
+                if let Err(e) = self.reload_account(&account_id).await {
+                    tracing::warn!("[Quota] Failed to reload account {}: {}", account_id, e);
+                } else {
+                    tracing::info!(
+                        "[Quota] Reloaded account {} (protected_models synced)",
+                        account_id
+                    );
+                }
+            }
+
+            // [FIX #1477] 检查并处理待删除的账号（彻底清理缓存）
+            let pending_delete = crate::proxy::server::take_pending_delete_accounts().await;
+            for account_id in pending_delete {
+                self.remove_account(&account_id);
                 tracing::info!(
-                    "[Quota] Reloaded account {} (protected_models synced)",
+                    "[Proxy] Purged deleted account {} from all caches",
                     account_id
                 );
             }
-        }
 
-        // [FIX #1477] 检查并处理待删除的账号（彻底清理缓存）
-        let pending_delete = crate::proxy::server::take_pending_delete_accounts();
-        for account_id in pending_delete {
-            self.remove_account(&account_id);
-            tracing::info!(
-                "[Proxy] Purged deleted account {} from all caches",
-                account_id
-            );
-        }
+            // 【优化 Issue #284】添加 5 秒超时，防止死锁
+            let timeout_duration = std::time::Duration::from_secs(5);
+            let res = tokio::time::timeout(
+                timeout_duration,
+                self.get_token_internal(quota_group, force_rotate, session_id, target_model, exclude_account_ids),
+            )
+            .await;
 
-        // 【优化 Issue #284】添加 5 秒超时，防止死锁
-        let timeout_duration = std::time::Duration::from_secs(5);
-        match tokio::time::timeout(
-            timeout_duration,
-            self.get_token_internal(quota_group, force_rotate, session_id, target_model),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(
-                "Token acquisition timeout (5s) - system too busy or deadlock detected".to_string(),
-            ),
+            match res {
+                Ok(Ok(success)) => return Ok(success),
+                Ok(Err(e)) => {
+                    if e.contains("Wait 2s") {
+                        if retry_count >= max_queue_wait / 2 {
+                            return Err("PREDICTIVE_TIMEOUT: Request timed out after waiting in queue for 120s.".to_string());
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        retry_count += 1;
+                        continue;
+                    }
+                    return Err(e);
+                }
+                Err(_) => {
+                    return Err(
+                        "Token acquisition timeout (5s) - system too busy or deadlock detected".to_string(),
+                    );
+                }
+            }
         }
     }
 
@@ -1113,12 +1167,150 @@ impl TokenManager {
         force_rotate: bool,
         session_id: Option<&str>,
         target_model: &str,
+        exclude_account_ids: Option<&std::collections::HashSet<String>>,
     ) -> Result<(String, String, String, String, u64), String> {
         let mut tokens_snapshot: Vec<ProxyToken> =
             self.tokens.iter().map(|e| e.value().clone()).collect();
+
+        // [FIX 429-RACE] Immediately discard accounts that the caller has already seen
+        // return 429/503 on this request. This prevents the async race condition where
+        // mark_rate_limited_async hasn't finished propagating before the next get_token call.
+        if let Some(excluded) = exclude_account_ids {
+            if !excluded.is_empty() {
+                tokens_snapshot.retain(|t| !excluded.contains(&t.account_id));
+                if !excluded.is_empty() {
+                    tracing::debug!("[429-Fix] Excluded {} account(s) from selection: {:?}", excluded.len(), excluded);
+                }
+            }
+        }
+
         let mut total = tokens_snapshot.len();
         if total == 0 {
             return Err("Token pool is empty".to_string());
+        }
+
+        // [NEW] 预见性限流逻辑 (Predictive Limits)
+        let predictive_cfg = self.predictive_config.read().await.clone();
+        if predictive_cfg.enabled {
+            let tracker = &crate::proxy::usage_tracker::USAGE_TRACKER;
+            let mut available_count = 0;
+            
+            for t in &tokens_snapshot {
+                let rpm = tracker.get_account_rpm(&t.email);
+                let tpm = tracker.get_account_tpm(&t.email);
+                
+                let mut actual_rpm_limit = 14;
+                let mut actual_tpm_limit = 30000;
+                
+                use crate::proxy::config::TierLimitMode;
+
+                let mut tier_upper = t.subscription_tier.as_deref().unwrap_or("FREE").to_uppercase();
+                    if tier_upper.contains("ULTRA") { tier_upper = "ULTRA".to_string(); }
+                    else if tier_upper.contains("PRO") { tier_upper = "PRO".to_string(); }
+                
+                if tier_upper == "PRO" {
+                    match predictive_cfg.pro_tier.mode {
+                        TierLimitMode::Auto => {
+                            actual_rpm_limit = 360;
+                            actual_tpm_limit = 4_000_000;
+                        }
+                        TierLimitMode::Manual => {
+                            actual_rpm_limit = if predictive_cfg.pro_tier.rpm_limit > 0 { predictive_cfg.pro_tier.rpm_limit } else { predictive_cfg.rpm_limit };
+                            actual_tpm_limit = if predictive_cfg.pro_tier.tpm_limit > 0 { predictive_cfg.pro_tier.tpm_limit } else { predictive_cfg.tpm_limit };
+                        }
+                    }
+                } else if tier_upper == "ULTRA" || tier_upper == "PREMIUM" {
+                    match predictive_cfg.ultra_tier.mode {
+                        TierLimitMode::Auto => {
+                            actual_rpm_limit = 1000;
+                            actual_tpm_limit = 8_000_000;
+                        }
+                        TierLimitMode::Manual => {
+                            actual_rpm_limit = if predictive_cfg.ultra_tier.rpm_limit > 0 { predictive_cfg.ultra_tier.rpm_limit } else { predictive_cfg.rpm_limit };
+                            actual_tpm_limit = if predictive_cfg.ultra_tier.tpm_limit > 0 { predictive_cfg.ultra_tier.tpm_limit } else { predictive_cfg.tpm_limit };
+                        }
+                    }
+                } else {
+                    match predictive_cfg.free_tier.mode {
+                        TierLimitMode::Auto => {
+                            actual_rpm_limit = 15;
+                            actual_tpm_limit = 1_000_000;
+                        }
+                        TierLimitMode::Manual => {
+                            actual_rpm_limit = if predictive_cfg.free_tier.rpm_limit > 0 { predictive_cfg.free_tier.rpm_limit } else { predictive_cfg.rpm_limit };
+                            actual_tpm_limit = if predictive_cfg.free_tier.tpm_limit > 0 { predictive_cfg.free_tier.tpm_limit } else { predictive_cfg.tpm_limit };
+                        }
+                    }
+                }
+
+                if rpm < actual_rpm_limit && tpm < actual_tpm_limit {
+                    available_count += 1;
+                }
+            }
+            
+            if available_count == 0 {
+                use crate::proxy::config::PredictiveQueueMode;
+                match predictive_cfg.mode {
+                    PredictiveQueueMode::Reject => {
+                        return Err("PREDICTIVE_REJECT: All accounts have reached rate limit threshold (TPM/RPM).".to_string());
+                    }
+                    PredictiveQueueMode::Queue => {
+                        // In Queue mode, we return a wait error so the router will sleep and retry
+                        tracing::warn!("PREDICTIVE_QUEUE: All accounts reached RPM/TPM limit, queuing request for 2s.");
+                        return Err("All accounts limited. Wait 2s.".to_string());
+                    }
+                }
+            } else {
+                // Retain only accounts that haven't reached the limit
+                tokens_snapshot.retain(|t| {
+                    let rpm = tracker.get_account_rpm(&t.email);
+                    let tpm = tracker.get_account_tpm(&t.email);
+                    
+                    let mut actual_rpm_limit = 14;
+                    let mut actual_tpm_limit = 30000;
+                    
+                    let mut tier_upper = t.subscription_tier.as_deref().unwrap_or("FREE").to_uppercase();
+                    if tier_upper.contains("ULTRA") { tier_upper = "ULTRA".to_string(); }
+                    else if tier_upper.contains("PRO") { tier_upper = "PRO".to_string(); }
+                    
+                    if tier_upper == "PRO" {
+                        match predictive_cfg.pro_tier.mode {
+                            crate::proxy::config::TierLimitMode::Auto => {
+                                actual_rpm_limit = 360;
+                                actual_tpm_limit = 4_000_000;
+                            }
+                            crate::proxy::config::TierLimitMode::Manual => {
+                                actual_rpm_limit = if predictive_cfg.pro_tier.rpm_limit > 0 { predictive_cfg.pro_tier.rpm_limit } else { predictive_cfg.rpm_limit };
+                                actual_tpm_limit = if predictive_cfg.pro_tier.tpm_limit > 0 { predictive_cfg.pro_tier.tpm_limit } else { predictive_cfg.tpm_limit };
+                            }
+                        }
+                    } else if tier_upper == "ULTRA" || tier_upper == "PREMIUM" {
+                        match predictive_cfg.ultra_tier.mode {
+                            crate::proxy::config::TierLimitMode::Auto => {
+                                actual_rpm_limit = 1000;
+                                actual_tpm_limit = 8_000_000;
+                            }
+                            crate::proxy::config::TierLimitMode::Manual => {
+                                actual_rpm_limit = if predictive_cfg.ultra_tier.rpm_limit > 0 { predictive_cfg.ultra_tier.rpm_limit } else { predictive_cfg.rpm_limit };
+                                actual_tpm_limit = if predictive_cfg.ultra_tier.tpm_limit > 0 { predictive_cfg.ultra_tier.tpm_limit } else { predictive_cfg.tpm_limit };
+                            }
+                        }
+                    } else {
+                        match predictive_cfg.free_tier.mode {
+                            crate::proxy::config::TierLimitMode::Auto => {
+                                actual_rpm_limit = 15;
+                                actual_tpm_limit = 1_000_000;
+                            }
+                            crate::proxy::config::TierLimitMode::Manual => {
+                                actual_rpm_limit = if predictive_cfg.free_tier.rpm_limit > 0 { predictive_cfg.free_tier.rpm_limit } else { predictive_cfg.rpm_limit };
+                                actual_tpm_limit = if predictive_cfg.free_tier.tpm_limit > 0 { predictive_cfg.free_tier.tpm_limit } else { predictive_cfg.tpm_limit };
+                            }
+                        }
+                    }
+
+                    rpm < actual_rpm_limit && tpm < actual_tpm_limit
+                });
+            }
         }
 
         // [NEW] 1. 动态能力过滤 (Capability Filter)
@@ -1135,8 +1327,25 @@ impl TokenManager {
         let candidate_count_before = tokens_snapshot.len();
         
         // 此处假设所有受支持的模型都会出现在 model_quotas 中
-        // 如果 API 返回的配额信息不完整，可能会导致误杀，但为了严格性，我们执行此过滤
-        tokens_snapshot.retain(|t| t.model_quotas.contains_key(&normalized_target));
+        // 但如果 API 返回的配额信息不完整，会导致误杀。
+        // [FIX] Relaxed filtering to allow default models and generic gemini models when quota info is incomplete
+        tokens_snapshot.retain(|t| {
+            if normalized_target == "default" {
+                return true;
+            }
+            if t.model_quotas.is_empty() {
+                return true;
+            }
+            if t.model_quotas.contains_key(&normalized_target) {
+                return true;
+            }
+            // If it's a generic gemini request, don't drop the account even if specific ID isn't in quotas
+            if normalized_target.starts_with("gemini") {
+                return true;
+            }
+            // Strict filtering ONLY for claude/opus/special models
+            false
+        });
 
         if tokens_snapshot.is_empty() {
             if candidate_count_before > 0 {
@@ -1594,10 +1803,40 @@ impl TokenManager {
                                 }
                             }
                         } else {
-                            return Err(format!("All accounts limited. Wait {}s.", wait_sec));
+                            // [FIX] Instead of returning Err instantly when wait_sec > 2, 
+                            // we force fallback to break deadlock caused by 5xx Soft Avoidance.
+                            tracing::warn!(
+                                "All accounts limited (min_wait {}s > 2s). Forcing fallback check to break deadlock...",
+                                wait_sec
+                            );
+                            
+                            let fallback_token = tokens_snapshot.iter()
+                                .find(|t| !attempted.contains(&t.account_id)
+                                    && !(quota_protection_enabled && t.protected_models.contains(&normalized_target)));
+                                    
+                            if let Some(t) = fallback_token {
+                                tracing::info!("✅ Fallback successful! Forcing use of account: {}", t.email);
+                                t.clone()
+                            } else {
+                                return Err(format!("All accounts limited. Wait {}s.", wait_sec));
+                            }
                         }
                     } else {
-                        return Err("All accounts failed or unhealthy.".to_string());
+                        tracing::warn!(
+                            "Circuit breaker deadlock detected! All accounts marked unhealthy but not rate-limited. Forcing fallback selection..."
+                        );
+                        
+                        // Fallback: Pick an account ignoring health and rate limits
+                        let fallback_token = tokens_snapshot.iter()
+                            .find(|t| !attempted.contains(&t.account_id)
+                                && !(quota_protection_enabled && t.protected_models.contains(&normalized_target)));
+                                
+                        if let Some(t) = fallback_token {
+                            tracing::info!("✅ Fallback successful! Forcing use of account: {}", t.email);
+                            t.clone()
+                        } else {
+                            return Err("All accounts failed or unhealthy, even after fallback.".to_string());
+                        }
                     }
                 }
             };
@@ -2353,7 +2592,7 @@ impl TokenManager {
 
     /// 使用 Authorization Code 交换 Refresh Token (Web OAuth)
     pub async fn exchange_code(&self, code: &str, redirect_uri: &str) -> Result<String, String> {
-        crate::modules::oauth::exchange_code(code, redirect_uri)
+        crate::modules::oauth::exchange_code(code, redirect_uri, None)
             .await
             .and_then(|t| {
                 t.refresh_token
@@ -2363,7 +2602,7 @@ impl TokenManager {
 
     /// 获取 OAuth URL (支持自定义 Redirect URI)
     pub fn get_oauth_url_with_redirect(&self, redirect_uri: &str, state: &str) -> String {
-        crate::modules::oauth::get_auth_url(redirect_uri, state)
+        crate::modules::oauth::get_auth_url(redirect_uri, state, None)
     }
 
     /// 获取用户信息 (Email 等)
@@ -2395,21 +2634,18 @@ impl TokenManager {
         let email_clone = email.to_string();
         let refresh_token_clone = refresh_token.to_string();
 
-        tokio::task::spawn_blocking(move || {
-            let token_data = crate::models::TokenData::new(
-                token_info.access_token,
-                refresh_token_clone,
-                token_info.expires_in,
-                Some(email_clone.clone()),
-                Some(project_id),
-                None, // session_id
-            );
+        let token_data = crate::models::TokenData::new(
+            token_info.access_token,
+            refresh_token_clone,
+            token_info.expires_in,
+            Some(email_clone.clone()),
+            Some(project_id),
+            None, // session_id
+        );
 
-            crate::modules::account::upsert_account(email_clone, None, token_data)
-        })
-        .await
-        .map_err(|e| format!("Task join error: {}", e))?
-        .map_err(|e| format!("Failed to save account: {}", e))?;
+        crate::modules::account::upsert_account(email_clone, None, token_data)
+            .await
+            .map_err(|e| format!("Failed to save account: {}", e))?;
 
         // 4. 重新加载 (更新内存)
         self.reload_all_accounts().await.map(|_| ())
@@ -2606,8 +2842,7 @@ impl TokenManager {
 
     /// Set is_forbidden status for an account (called when proxy encounters 403)
     pub async fn set_forbidden(&self, account_id: &str, reason: &str) -> Result<(), String> {
-        // [FIX] 调用封装好的模块函数，确保线程安全地更新账号文件和索引
-        crate::modules::account::mark_account_forbidden(account_id, reason)?;
+        crate::modules::account::mark_account_forbidden(account_id, reason).await?;
 
         // Clear sticky session if forbidden
         self.session_accounts.retain(|_, v| *v != account_id);
@@ -2731,6 +2966,11 @@ mod tests {
                 "disabled": false,
                 "proxy_disabled": proxy_disabled,
                 "proxy_disabled_reason": if proxy_disabled { "manual" } else { "" },
+                "quota": {
+                    "models": [
+                        { "name": "gemini-1.5-flash", "percentage": 90 }
+                    ]
+                },
                 "created_at": now,
                 "last_used": now
             });
@@ -2803,7 +3043,7 @@ mod tests {
 
         // Two accounts in pool. acc1 has higher quota -> should be selected and bound first.
         write_account("acc1", "a@test.com", 90, false);
-        write_account("acc2", "b@test.com", 10, false);
+        write_account("acc2", "b@test.com", 30, false);
 
         let manager = TokenManager::new(tmp_root.clone());
         manager.load_accounts().await.unwrap();

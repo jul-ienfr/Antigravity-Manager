@@ -17,13 +17,15 @@ import { relaunch } from '@tauri-apps/plugin-process';
 
 import DebugConsole from '../components/debug/DebugConsole';
 import ProxyPoolSettings from '../components/settings/ProxyPoolSettings';
+import HackerSettings from '../components/settings/HackerSettings';
+import { Skull } from 'lucide-react';
 
 
 function Settings() {
     const { t, i18n } = useTranslation();
     const { config, loadConfig, saveConfig, updateLanguage, updateTheme } = useConfigStore();
     const { enable, disable, isEnabled } = useDebugConsole();
-    const [activeTab, setActiveTab] = useState<'general' | 'account' | 'proxy' | 'advanced' | 'debug' | 'about'>('general');
+    const [activeTab, setActiveTab] = useState<'general' | 'account' | 'proxy' | 'advanced' | 'hacker' | 'debug' | 'about'>('general');
     const [formData, setFormData] = useState<AppConfig>({
         language: 'zh',
         theme: 'system',
@@ -53,6 +55,19 @@ function Settings() {
                 auto_failover: true,
                 strategy: 'priority',
                 account_bindings: {}
+            },
+            hacker: {
+                enable_advanced_stealth: false,
+                enable_amnesia: false,
+                enable_god_mode: false,
+                enable_time_travel: false,
+                enable_shadow_ban_bypass: false,
+                enable_anti_censor: false,
+                enable_auto_retry: false,
+                enable_auto_accept: false,
+                enable_auto_hook: false,
+                enable_auto_harvest: true,
+                enable_context_inception: false,
             }
         },
         scheduled_warmup: {
@@ -400,6 +415,16 @@ function Settings() {
                             {t('settings.tabs.debug')}
                         </button>
                         <button
+                            className={`px-6 py-2 rounded-full text-sm font-medium transition-all flex items-center gap-2 ${activeTab === 'hacker'
+                                ? 'bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400 shadow-sm border border-red-200 dark:border-red-800'
+                                : 'text-gray-600 dark:text-gray-400 hover:text-red-500 dark:hover:text-red-400'
+                                }`}
+                            onClick={() => setActiveTab('hacker')}
+                        >
+                            <Skull className="w-4 h-4" />
+                            {t('settings.tabs.hacker')}
+                        </button>
+                        <button
                             className={`px-6 py-2 rounded-full text-sm font-medium transition-all ${activeTab === 'about'
                                 ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
                                 : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
@@ -449,6 +474,7 @@ function Settings() {
                                     <option value="ko">한국어</option>
                                     <option value="ru">Русский</option>
                                     <option value="ar">العربية</option>
+                                    <option value="fr">Français</option>
                                 </select>
                             </div>
 
@@ -659,6 +685,31 @@ function Settings() {
                                     </p>
                                 </div>
                             </>
+                        </div>
+                    )}
+
+                    {/* Hacker Settings */}
+                    {activeTab === 'hacker' && (
+                        <div className="animate-in fade-in duration-500">
+                            <HackerSettings
+                                config={formData.proxy.hacker}
+                                onChange={async (newConfig) => {
+                                    const newFormData = {
+                                        ...formData,
+                                        proxy: {
+                                            ...formData.proxy,
+                                            hacker: newConfig
+                                        }
+                                    };
+                                    setFormData(newFormData);
+                                    // Hot Save
+                                    try {
+                                        await saveConfig(newFormData);
+                                    } catch (error) {
+                                        showToast(`Erreur: ${error}`, 'error');
+                                    }
+                                }}
+                            />
                         </div>
                     )}
 

@@ -68,6 +68,7 @@ pub fn create_openai_sse_stream<S, E>(
     model: String,
     session_id: String,
     message_count: usize,
+    include_usage: bool,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> 
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
@@ -162,7 +163,24 @@ where
                                                                     serde_json::to_string(func_call).unwrap_or_default().hash(&mut hasher);
                                                                     let call_id = format!("call_{:x}", hasher.finish());
  
-                                                                    let tool_call_chunk = json!({
+                                                                    // Part 1: Initial role chunk (only if first tool call)
+                                                                    if tool_call_index == 0 {
+                                                                        let role_chunk = json!({
+                                                                            "id": &stream_id,
+                                                                            "object": "chat.completion.chunk",
+                                                                            "created": created_ts,
+                                                                            "model": &model,
+                                                                            "choices": [{
+                                                                                "index": idx as u32,
+                                                                                "delta": { "role": "assistant" },
+                                                                                "finish_reason": serde_json::Value::Null
+                                                                            }]
+                                                                        });
+                                                                        yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&role_chunk).unwrap_or_default())));
+                                                                    }
+
+                                                                    // Part 2: Tool call declaration (id, type, name)
+                                                                    let tool_call_start = json!({
                                                                         "id": &stream_id,
                                                                         "object": "chat.completion.chunk",
                                                                         "created": created_ts,
@@ -170,20 +188,38 @@ where
                                                                         "choices": [{
                                                                             "index": idx as u32,
                                                                             "delta": {
-                                                                                "role": "assistant",
                                                                                 "tool_calls": [{
                                                                                     "index": tool_call_index,
                                                                                     "id": call_id,
                                                                                     "type": "function",
-                                                                                    "function": { "name": name, "arguments": args_str }
+                                                                                    "function": { "name": name, "arguments": "" }
                                                                                 }]
                                                                             },
                                                                             "finish_reason": serde_json::Value::Null
                                                                         }]
                                                                     });
+                                                                    yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&tool_call_start).unwrap_or_default())));
+
+                                                                    // Part 3: Tool call arguments
+                                                                    let tool_call_args = json!({
+                                                                        "id": &stream_id,
+                                                                        "object": "chat.completion.chunk",
+                                                                        "created": created_ts,
+                                                                        "model": &model,
+                                                                        "choices": [{
+                                                                            "index": idx as u32,
+                                                                            "delta": {
+                                                                                "tool_calls": [{
+                                                                                    "index": tool_call_index,
+                                                                                    "function": { "arguments": args_str }
+                                                                                }]
+                                                                            },
+                                                                            "finish_reason": serde_json::Value::Null
+                                                                        }]
+                                                                    });
+                                                                    yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&tool_call_args).unwrap_or_default())));
+                                                                    
                                                                     tool_call_index += 1;
-                                                                    let sse_out = format!("data: {}\n\n", serde_json::to_string(&tool_call_chunk).unwrap_or_default());
-                                                                    yield Ok::<Bytes, String>(Bytes::from(sse_out));
                                                                 }
                                                             }
                                                         }
@@ -314,6 +350,20 @@ where
         }
 
         if !error_occurred {
+            if include_usage {
+                if let Some(usage) = final_usage {
+                    let usage_chunk = json!({
+                        "id": &stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": &model,
+                        "choices": [],
+                        "usage": usage
+                    });
+                    let sse_out = format!("data: {}\n\n", serde_json::to_string(&usage_chunk).unwrap_or_default());
+                    yield Ok::<Bytes, String>(Bytes::from(sse_out));
+                }
+            }
             yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
         }
     };
@@ -325,6 +375,7 @@ pub fn create_legacy_sse_stream<S, E>(
     model: String,
     session_id: String,
     message_count: usize,
+    include_usage: bool,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> 
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
@@ -416,6 +467,20 @@ where
             }
         }
         if !error_occurred {
+            if include_usage {
+                if let Some(usage) = final_usage {
+                    let usage_chunk = json!({
+                        "id": &stream_id,
+                        "object": "text_completion",
+                        "created": created_ts,
+                        "model": &model,
+                        "choices": [],
+                        "usage": usage
+                    });
+                    let sse_out = format!("data: {}\n\n", serde_json::to_string(&usage_chunk).unwrap_or_default());
+                    yield Ok::<Bytes, String>(Bytes::from(sse_out));
+                }
+            }
             yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
         }
     };
@@ -476,6 +541,7 @@ where
 
         let mut emitted_tool_calls = std::collections::HashSet::new();
         let mut accumulated_text = String::new();
+        let mut final_usage: Option<super::models::OpenAIUsage> = None;
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -495,6 +561,11 @@ where
 
                                     if let Ok(mut json) = serde_json::from_str::<Value>(json_part) {
                                         let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) { inner } else { json };
+                                        
+                                        if let Some(u) = actual_data.get("usageMetadata") {
+                                            final_usage = extract_usage_metadata(u);
+                                        }
+
                                         if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
                                             if candidates.len() > 0 {
                                                 tracing::debug!("[Codex-Stream-Debug] Raw Candidate: {:?}", candidates[0]);
@@ -633,7 +704,7 @@ where
         yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&output_item_done).unwrap())));
 
         // 8. response.completed
-        let completed_ev = json!({
+        let mut completed_ev = json!({
             "type": "response.completed",
             "response": {
                 "id": &response_id,
@@ -650,6 +721,15 @@ where
                 }]
             }
         });
+
+        if let Some(usage) = final_usage {
+            if let Some(resp_obj) = completed_ev.get_mut("response").and_then(|r| r.as_object_mut()) {
+                if let Ok(usage_val) = serde_json::to_value(usage) {
+                    resp_obj.insert("usage".to_string(), usage_val);
+                }
+            }
+        }
+
         yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&completed_ev).unwrap())));
     };
     Box::pin(stream)
@@ -699,7 +779,8 @@ mod tests {
             gemini_stream,
             "gemini-1.5-flash".to_string(),
             "test-session".to_string(),
-            0
+            0,
+            false,
         );
 
         let mut chunks = Vec::new();

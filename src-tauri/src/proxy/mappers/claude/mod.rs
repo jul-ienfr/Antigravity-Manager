@@ -32,7 +32,7 @@ pub fn create_claude_sse_stream<S, E>(
     estimated_prompt_tokens: Option<u32>, // [FIX] Estimated tokens for calibrator learning
     message_count: usize, // [NEW v4.0.0] Message count for rewind detection
     client_adapter: Option<std::sync::Arc<dyn ClientAdapter>>, // [NEW] Adapter reference
-    registered_tool_names: Vec<String>, // [FIX #MCP] Tool names for fuzzy matching
+    tool_schemas: std::collections::HashMap<String, serde_json::Value>, // [NEW] Tool schemas for dynamic validation
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> 
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
@@ -50,8 +50,9 @@ where
         state.context_limit = context_limit;
         state.estimated_prompt_tokens = estimated_prompt_tokens; // [FIX] Pass estimated tokens
         state.set_client_adapter(client_adapter); // [NEW] Set adapter
-        state.set_registered_tool_names(registered_tool_names); // [FIX #MCP] Set tool names
+        state.set_tool_schemas(tool_schemas); // [NEW] Set tool schemas
         let mut buffer = BytesMut::new();
+        let mut sse_data_buffer = String::new(); // [NEW #BUFFER] Buffer for fragmented JSON payloads
 
         loop {
             // [NEW] 60秒心跳保活: 延长超时时间以增加网络抖动容错
@@ -73,22 +74,61 @@ where
                                     let line = line_str.trim();
                                     if line.is_empty() { continue; }
 
-                                    if let Some(sse_chunks) = process_sse_line(line, &mut state, &trace_id, &email) {
-                                        for sse_chunk in sse_chunks {
-                                            yield Ok(sse_chunk);
+                                    // [FIX #BUFFER] Handle SSE specific formatting
+                                    if line.starts_with("data: ") {
+                                        let data_piece = &line[6..];
+                                        
+                                        if data_piece == "[DONE]" {
+                                            if let Some(sse_chunks) = process_sse_line(line, &mut state, &trace_id, &email) {
+                                                for sse_chunk in sse_chunks { yield Ok(sse_chunk); }
+                                            }
+                                            sse_data_buffer.clear();
+                                            continue;
                                         }
+
+                                        // Only append non-empty data pieces
+                                        let trimmed_piece = data_piece.trim();
+                                        if !trimmed_piece.is_empty() {
+                                            sse_data_buffer.push_str(trimmed_piece);
+
+                                            // Try to parse the accumulated JSON
+                                            match serde_json::from_str::<serde_json::Value>(&sse_data_buffer) {
+                                                Ok(json_value) => {
+                                                    // It's a valid JSON! Process it.
+                                                    if let Some(sse_chunks) = process_parsed_json(json_value, &mut state, &trace_id, &email) {
+                                                        for sse_chunk in sse_chunks {
+                                                            yield Ok(sse_chunk);
+                                                        }
+                                                    }
+                                                    // Reset buffer after successful consumption
+                                                    sse_data_buffer.clear();
+                                                }
+                                                Err(e) => {
+                                                    // Not valid JSON yet, might be fragmented. Keep accumulating on next line.
+                                                    tracing::trace!("[{}] Fragmented JSON detected, buffering... (len: {}): {}", trace_id, sse_data_buffer.len(), e);
+                                                }
+                                            }
+                                        }
+                                    } else if line.starts_with(":") {
+                                        // SSE Comment (Ping usually)
+                                        tracing::debug!("[{}] Received SSE comment: {}", trace_id, line);
+                                    } else {
+                                        // Unrecognized line format
+                                        tracing::warn!("[{}] Unrecognized SSE line: {}", trace_id, line);
                                     }
                                 }
                             }
                         }
                         Err(e) => {
+                            let (error_type, msg, _) = crate::proxy::mappers::error_classifier::classify_stream_error(&e);
                             let error_json = serde_json::json!({
+                                "type": "error",
                                 "error": {
-                                    "message": format!("Stream error: {}", e),
-                                    "type": "stream_error"
+                                    "type": error_type,
+                                    "message": format!("{}: {}", msg, e)
                                 }
                             });
-                            yield Ok(Bytes::from(format!("data: {}\n\n", error_json)));
+                            yield Ok(Bytes::from(format!("event: error\ndata: {}\n\n", error_json)));
                             break;
                         }
                     }
@@ -108,9 +148,19 @@ where
                  let line = line_str.trim();
                  if !line.is_empty() {
                      tracing::debug!("[{}] SSE Termination: Flushing remaining {} bytes in buffer", trace_id, buffer.len());
-                     if let Some(sse_chunks) = process_sse_line(line, &mut state, &trace_id, &email) {
-                         for sse_chunk in sse_chunks {
-                             yield Ok(sse_chunk);
+                     if line.starts_with("data: ") {
+                         let data_piece = &line[6..];
+                         if data_piece == "[DONE]" {
+                             if let Some(sse_chunks) = process_sse_line(line, &mut state, &trace_id, &email) {
+                                 for sse_chunk in sse_chunks { yield Ok(sse_chunk); }
+                             }
+                         } else {
+                             sse_data_buffer.push_str(data_piece.trim());
+                             if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&sse_data_buffer) {
+                                 if let Some(sse_chunks) = process_parsed_json(json_value, &mut state, &trace_id, &email) {
+                                     for sse_chunk in sse_chunks { yield Ok(sse_chunk); }
+                                 }
+                             }
                          }
                      }
                  }
@@ -173,8 +223,8 @@ where
     })
 }
 
-/// 处理单行 SSE 数据
-fn process_sse_line(line: &str, state: &mut StreamingState, trace_id: &str, email: &str) -> Option<Vec<Bytes>> {
+/// 处理单行 SSE 数据 (主要用于 [DONE] 标识)
+fn process_sse_line(line: &str, state: &mut StreamingState, _trace_id: &str, _email: &str) -> Option<Vec<Bytes>> {
     if !line.starts_with("data: ") {
         return None;
     }
@@ -192,12 +242,11 @@ fn process_sse_line(line: &str, state: &mut StreamingState, trace_id: &str, emai
         return Some(chunks);
     }
 
-    // 解析 JSON
-    let json_value: serde_json::Value = match serde_json::from_str(data_str) {
-        Ok(v) => v,
-        Err(_) => return None,
-    };
+    None
+}
 
+/// 处理已解析的 JSON 响应
+fn process_parsed_json(json_value: serde_json::Value, state: &mut StreamingState, trace_id: &str, email: &str) -> Option<Vec<Bytes>> {
     let mut chunks = Vec::new();
 
     // 解包 response 字段 (如果存在)
@@ -269,6 +318,21 @@ fn process_sse_line(line: &str, state: &mut StreamingState, trace_id: &str, emai
         .and_then(|cand| cand.get("finishReason"))
         .and_then(|f| f.as_str())
     {
+        // [NEW] Intercept SAFETY blocks before finishing
+        if finish_reason == "SAFETY" || finish_reason == "BLOCKLIST" || finish_reason == "PROHIBITED_CONTENT" {
+            tracing::warn!("[{}] output blocked by Google SAFETY filters (reason: {})", trace_id, finish_reason);
+            let safety_msg = format!("\n\n[System] The response was blocked by Google's safety filters ({}). Try adjusting your prompt to avoid sensitive topics.", finish_reason);
+            
+            if state.current_block_type() != crate::proxy::mappers::claude::streaming::BlockType::Text {
+                chunks.extend(state.start_block(
+                    crate::proxy::mappers::claude::streaming::BlockType::Text,
+                    serde_json::json!({ "type": "text", "text": safety_msg })
+                ));
+            } else {
+                chunks.push(state.emit_delta("text_delta", serde_json::json!({ "text": safety_msg })));
+            }
+        }
+
         let usage = raw_json
             .get("usageMetadata")
             .and_then(|u| serde_json::from_value::<UsageMetadata>(u.clone()).ok());
@@ -461,9 +525,10 @@ mod tests {
     fn test_process_sse_line_with_text() {
         let mut state = StreamingState::new();
 
-        let test_data = r#"data: {"candidates":[{"content":{"parts":[{"text":"Hello"}]}}],"usageMetadata":{},"modelVersion":"test","responseId":"123"}"#;
+        let json_str = r#"{"candidates":[{"content":{"parts":[{"text":"Hello"}]}}],"usageMetadata":{},"modelVersion":"test","responseId":"123"}"#;
+        let test_data: serde_json::Value = serde_json::from_str(json_str).unwrap();
         
-        let result = process_sse_line(test_data, &mut state, "test_id", "test@example.com");
+        let result = process_parsed_json(test_data, &mut state, "test_id", "test@example.com");
         assert!(result.is_some());
 
         let chunks = result.unwrap();
@@ -512,7 +577,7 @@ mod tests {
             None,
             1, // message_count
             None, // client_adapter
-            Vec::new(), // registered_tool_names
+            std::collections::HashMap::new(), // tool_schemas
         );
 
         // 3. 收集输出

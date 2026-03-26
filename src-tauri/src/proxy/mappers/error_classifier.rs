@@ -12,16 +12,47 @@
 pub fn classify_stream_error<E: std::fmt::Display>(error: &E) -> (&'static str, &'static str, &'static str) {
     let error_str = error.to_string().to_lowercase();
     
-    if error_str.contains("timeout") || error_str.contains("deadline") {
+    // Check for explicit HTTP/gRPC codes first
+    if error_str.contains("401") || error_str.contains("unauthenticated") {
+        (
+            "authentication_error",
+            "API key invalid or expired. Please check your token settings.",
+            "errors.stream.authentication_error"
+        )
+    } else if error_str.contains("403") || error_str.contains("permission_denied") || error_str.contains("forbidden") {
+        (
+            "permission_error",
+            "Access denied by the upstream provider. Account may be flagged or require validation.",
+            "errors.stream.permission_error"
+        )
+    } else if error_str.contains("429") || error_str.contains("428") || error_str.contains("too many requests") || error_str.contains("quota") || error_str.contains("resource_exhausted") {
+        (
+            "rate_limit_error",
+            "Rate limit exceeded or quota exhausted. Please try again later.",
+            "errors.stream.rate_limit_error"
+        )
+    } else if error_str.contains("500") || error_str.contains("internal") {
+        (
+            "server_error",
+            "Upstream provider encountered an internal error. Please try again.",
+            "errors.stream.server_error"
+        )
+    } else if error_str.contains("502") || error_str.contains("503") || error_str.contains("504") || error_str.contains("overloaded") || error_str.contains("unavailable") || error_str.contains("bad gateway") {
+        (
+            "overloaded_error",
+            "Upstream server is temporarily overloaded or unreachable.",
+            "errors.stream.overloaded_error"
+        )
+    } else if error_str.contains("timeout") || error_str.contains("deadline") || error_str.contains("timed out") {
         (
             "timeout_error",
-            "Request timeout, please check your network connection",
+            "Request timeout, please check your network connection.",
             "errors.stream.timeout_error"
         )
     } else if error_str.contains("connection") || error_str.contains("connect") || error_str.contains("dns") {
         (
             "connection_error",
-            "Connection failed, please check your network or proxy settings",
+            "Connection failed, please check your network or proxy settings.",
             "errors.stream.connection_error"
         )
     } else if error_str.contains("decode") || error_str.contains("parse") {
@@ -33,13 +64,13 @@ pub fn classify_stream_error<E: std::fmt::Display>(error: &E) -> (&'static str, 
     } else if error_str.contains("stream") || error_str.contains("body") {
         (
             "stream_error",
-            "Stream transmission error, please retry later",
+            "Stream transmission error, please retry later.",
             "errors.stream.stream_error"
         )
     } else {
         (
             "unknown_error",
-            "Unknown error occurred",
+            "Unknown error occurred.",
             "errors.stream.unknown_error"
         )
     }

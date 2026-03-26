@@ -95,7 +95,7 @@ pub fn create_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                                  match modules::account::fetch_quota_with_retry(&mut account).await {
                                      Ok(quota) => {
                                          // Save
-                                         let _ = modules::update_account_quota(&account.id, quota);
+                                         let _ = modules::update_account_quota(&account.id, quota).await;
                                          // Update tray display
                                          update_tray_menus(&app_handle);
                                      },

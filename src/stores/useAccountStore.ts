@@ -5,11 +5,13 @@ import * as accountService from '../services/accountService';
 interface AccountState {
     accounts: Account[];
     currentAccount: Account | null;
+    rateLimitStatus: import('../types/account').RateLimitStatus | null;
     loading: boolean;
     error: string | null;
 
     // Actions
     fetchAccounts: () => Promise<void>;
+    fetchRateLimitStatus: () => Promise<void>;
     fetchCurrentAccount: () => Promise<void>;
     addAccount: (email: string, refreshToken: string) => Promise<void>;
     deleteAccount: (accountId: string) => Promise<void>;
@@ -20,7 +22,7 @@ interface AccountState {
     reorderAccounts: (accountIds: string[]) => Promise<void>;
 
     // 新增 actions
-    startOAuthLogin: () => Promise<void>;
+    startOAuthLogin: (oauthClientKey?: string) => Promise<void>;
     completeOAuthLogin: () => Promise<void>;
     cancelOAuthLogin: () => Promise<void>;
     importV1Accounts: () => Promise<void>;
@@ -36,8 +38,19 @@ interface AccountState {
 export const useAccountStore = create<AccountState>((set, get) => ({
     accounts: [],
     currentAccount: null,
+    rateLimitStatus: null,
     loading: false,
     error: null,
+
+    fetchRateLimitStatus: async () => {
+        try {
+            const { request: invoke } = await import('../utils/request');
+            const status = await invoke<import('../types/account').RateLimitStatus>('get_rate_limit_status');
+            set({ rateLimitStatus: status });
+        } catch (error) {
+            console.error('[Store] Fetch rate limit status failed:', error);
+        }
+    },
 
     fetchAccounts: async () => {
         set({ loading: true, error: null });
@@ -172,10 +185,10 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         }
     },
 
-    startOAuthLogin: async () => {
+    startOAuthLogin: async (oauthClientKey?: string) => {
         set({ loading: true, error: null });
         try {
-            await accountService.startOAuthLogin();
+            await accountService.startOAuthLogin(oauthClientKey);
             await get().fetchAccounts();
             set({ loading: false });
         } catch (error) {

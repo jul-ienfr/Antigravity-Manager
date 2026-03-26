@@ -34,7 +34,7 @@ export default function ThemeManager() {
             // Skip on Linux due to crash with transparent windows + softbuffer
             try {
                 if (!isLinux() && (window as any).__TAURI_INTERNALS__) {
-                    const bgColor = isDark ? '#1d232a' : '#FAFBFC';
+                    const bgColor = isDark ? { red: 0x1d, green: 0x23, blue: 0x2a, alpha: 255 } : { red: 0xFA, green: 0xFB, blue: 0xFC, alpha: 255 };
                     // Don't await this, let it happen in background to avoid blocking React render
                     getCurrentWindow().setBackgroundColor(bgColor).catch(e =>
                         console.error('Failed to set window background color:', e)

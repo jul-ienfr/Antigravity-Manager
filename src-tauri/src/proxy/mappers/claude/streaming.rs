@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 
 /// Known parameter remappings for Gemini → Claude compatibility
 /// [FIX] Gemini sometimes uses different parameter names than specified in tool schema
-pub fn remap_function_call_args(name: &str, args: &mut Value) {
+pub fn remap_function_call_args(name: &str, args: &mut Value, tool_schemas: &std::collections::HashMap<String, serde_json::Value>) {
     // [DEBUG] Always log incoming tool usage for diagnosis
     if let Some(obj) = args.as_object() {
         tracing::debug!("[Streaming] Tool Call: '{}' Args: {:?}", name, obj);
@@ -27,138 +27,88 @@ pub fn remap_function_call_args(name: &str, args: &mut Value) {
         return;
     }
 
-    if let Some(obj) = args.as_object_mut() {
-        // [IMPROVED] Case-insensitive matching for tool names
-        match name.to_lowercase().as_str() {
-            "grep" | "search" | "search_code_definitions" | "search_code_snippets" => {
-                // [FIX] Gemini hallucination: maps parameter description to "description" field
-                if let Some(desc) = obj.remove("description") {
-                    if !obj.contains_key("pattern") {
-                        obj.insert("pattern".to_string(), desc);
-                        tracing::debug!("[Streaming] Remapped Grep: description → pattern");
-                    }
-                }
-
-                // Gemini uses "query", Claude Code expects "pattern"
-                if let Some(query) = obj.remove("query") {
-                    if !obj.contains_key("pattern") {
-                        obj.insert("pattern".to_string(), query);
-                        tracing::debug!("[Streaming] Remapped Grep: query → pattern");
-                    }
-                }
-
-                // [CRITICAL FIX] Claude Code uses "path" (string), NOT "paths" (array)!
-                if !obj.contains_key("path") {
+    // Dynamic schema validation
+    if let Some(schema) = tool_schemas.get(name) {
+        if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
+            if let Some(obj) = args.as_object_mut() {
+                // Feature 1: If the tool expects `path` but Gemini gives `paths` (array)
+                if properties.contains_key("path") && !properties.contains_key("paths") {
                     if let Some(paths) = obj.remove("paths") {
-                        let path_str = if let Some(arr) = paths.as_array() {
-                            arr.get(0)
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(".")
-                                .to_string()
-                        } else if let Some(s) = paths.as_str() {
-                            s.to_string()
-                        } else {
-                            ".".to_string()
-                        };
-                        obj.insert("path".to_string(), serde_json::json!(path_str));
-                        tracing::debug!(
-                            "[Streaming] Remapped Grep: paths → path(\"{}\")",
-                            path_str
-                        );
-                    } else {
-                        // Default to current directory if missing
-                        obj.insert("path".to_string(), json!("."));
-                        tracing::debug!("[Streaming] Added default path: \".\"");
-                    }
-                }
-
-                // Note: We keep "-n" and "output_mode" if present as they are valid in Grep schema
-            }
-            "glob" => {
-                // [FIX] Gemini hallucination: maps parameter description to "description" field
-                if let Some(desc) = obj.remove("description") {
-                    if !obj.contains_key("pattern") {
-                        obj.insert("pattern".to_string(), desc);
-                        tracing::debug!("[Streaming] Remapped Glob: description → pattern");
-                    }
-                }
-
-                // Gemini uses "query", Claude Code expects "pattern"
-                if let Some(query) = obj.remove("query") {
-                    if !obj.contains_key("pattern") {
-                        obj.insert("pattern".to_string(), query);
-                        tracing::debug!("[Streaming] Remapped Glob: query → pattern");
-                    }
-                }
-
-                // [CRITICAL FIX] Claude Code uses "path" (string), NOT "paths" (array)!
-                if !obj.contains_key("path") {
-                    if let Some(paths) = obj.remove("paths") {
-                        let path_str = if let Some(arr) = paths.as_array() {
-                            arr.get(0)
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(".")
-                                .to_string()
-                        } else if let Some(s) = paths.as_str() {
-                            s.to_string()
-                        } else {
-                            ".".to_string()
-                        };
-                        obj.insert("path".to_string(), serde_json::json!(path_str));
-                        tracing::debug!(
-                            "[Streaming] Remapped Glob: paths → path(\"{}\")",
-                            path_str
-                        );
-                    } else {
-                        // Default to current directory if missing
-                        obj.insert("path".to_string(), json!("."));
-                        tracing::debug!("[Streaming] Added default path: \".\"");
-                    }
-                }
-            }
-            "read" => {
-                // Gemini might use "path" vs "file_path"
-                if let Some(path) = obj.remove("path") {
-                    if !obj.contains_key("file_path") {
-                        obj.insert("file_path".to_string(), path);
-                        tracing::debug!("[Streaming] Remapped Read: path → file_path");
-                    }
-                }
-            }
-            "ls" => {
-                // LS tool: ensure "path" parameter exists
-                if !obj.contains_key("path") {
-                    obj.insert("path".to_string(), json!("."));
-                    tracing::debug!("[Streaming] Remapped LS: default path → \".\"");
-                }
-            }
-            other => {
-                // [NEW] [Issue #785] Generic Property Mapping for all tools
-                // If a tool has "paths" (array of 1) but no "path", convert it.
-                let mut path_to_inject = None;
-                if !obj.contains_key("path") {
-                    if let Some(paths) = obj.get("paths").and_then(|v| v.as_array()) {
-                        if paths.len() == 1 {
-                            if let Some(p) = paths[0].as_str() {
-                                path_to_inject = Some(p.to_string());
-                            }
+                        if !obj.contains_key("path") {
+                            let path_str = if let Some(arr) = paths.as_array() {
+                                arr.get(0).and_then(|v| v.as_str()).unwrap_or(".").to_string()
+                            } else if let Some(s) = paths.as_str() {
+                                s.to_string()
+                            } else {
+                                ".".to_string()
+                            };
+                            obj.insert("path".to_string(), serde_json::json!(path_str));
+                            tracing::debug!("[Streaming] Dynamic Validation: paths → path({})", path_str);
                         }
                     }
                 }
 
-                if let Some(path) = path_to_inject {
-                    obj.insert("path".to_string(), json!(path));
-                    tracing::debug!(
-                        "[Streaming] Probabilistic fix for tool '{}': paths[0] → path(\"{}\")",
-                        other,
-                        path
-                    );
+                // Feature 2: If the tool expects `pattern` but Gemini gives `query` or `description`
+                if properties.contains_key("pattern") {
+                    if let Some(desc) = obj.remove("description") {
+                        if !obj.contains_key("pattern") && !properties.contains_key("description") {
+                            obj.insert("pattern".to_string(), desc);
+                            tracing::debug!("[Streaming] Dynamic Validation: description → pattern");
+                        }
+                    }
+                    if let Some(query) = obj.remove("query") {
+                        if !obj.contains_key("pattern") && !properties.contains_key("query") {
+                            obj.insert("pattern".to_string(), query);
+                            tracing::debug!("[Streaming] Dynamic Validation: query → pattern");
+                        }
+                    }
                 }
-                tracing::debug!(
-                    "[Streaming] Unmapped tool call processed via generic rules: {} (keys: {:?})",
-                    other,
-                    obj.keys()
-                );
+                
+                // Feature 3: If the tool expects `file_path` but Gemini gives `path`
+                if properties.contains_key("file_path") {
+                    if let Some(path) = obj.remove("path") {
+                        if !obj.contains_key("file_path") && !properties.contains_key("path") {
+                            obj.insert("file_path".to_string(), path);
+                            tracing::debug!("[Streaming] Dynamic Validation: path → file_path");
+                        }
+                    }
+                }
+
+                // Feature 4: Default LS path to "." if missing
+                if name.to_lowercase() == "ls" && properties.contains_key("path") && !obj.contains_key("path") {
+                    obj.insert("path".to_string(), json!("."));
+                    tracing::debug!("[Streaming] Dynamic Validation [LS]: default path → \".\"");
+                }
+
+                // Feature 5: Strip ALL keys that are not in `properties`
+                let keys_to_remove: Vec<String> = obj.keys()
+                    .filter(|k| !properties.contains_key(*k))
+                    .cloned()
+                    .collect();
+                
+                for k in keys_to_remove {
+                    tracing::debug!("[Streaming] Dynamic Validation: removing unknown argument '{}'", k);
+                    obj.remove(&k);
+                }
+            }
+        }
+    } else {
+        // Fallback or generic logic if we didn't get the schema
+        if let Some(obj) = args.as_object_mut() {
+            let mut path_to_inject = None;
+            if !obj.contains_key("path") {
+                if let Some(paths) = obj.get("paths").and_then(|v| v.as_array()) {
+                    if paths.len() == 1 {
+                        if let Some(p) = paths[0].as_str() {
+                            path_to_inject = Some(p.to_string());
+                        }
+                    }
+                }
+            }
+
+            if let Some(path) = path_to_inject {
+                obj.insert("path".to_string(), json!(path));
+                tracing::debug!("[Streaming] Probabilistic fix: paths[0] → path(\"{}\") for {}", path, name);
             }
         }
     }
@@ -232,8 +182,8 @@ pub struct StreamingState {
     pub has_content: bool,
     pub message_count: usize, // [NEW v4.0.0] Message count for rewind detection
     pub client_adapter: Option<std::sync::Arc<dyn ClientAdapter>>, // [FIX] Remove Box, use Arc<dyn> directly
-    // [FIX #MCP] Registered tool names for fuzzy matching
-    pub registered_tool_names: Vec<String>,
+    // [NEW] Tool schemas for dynamic validation
+    pub tool_schemas: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl StreamingState {
@@ -262,7 +212,7 @@ impl StreamingState {
             has_content: false,
             message_count: 0,
             client_adapter: None,
-            registered_tool_names: Vec::new(),
+            tool_schemas: std::collections::HashMap::new(),
         }
     }
 
@@ -271,9 +221,9 @@ impl StreamingState {
         self.client_adapter = adapter;
     }
 
-    // [FIX #MCP] Set registered tool names for fuzzy matching
-    pub fn set_registered_tool_names(&mut self, names: Vec<String>) {
-        self.registered_tool_names = names;
+    // [NEW] Set tool schemas
+    pub fn set_tool_schemas(&mut self, schemas: std::collections::HashMap<String, serde_json::Value>) {
+        self.tool_schemas = schemas;
     }
 
     /// 发送 SSE 事件
@@ -959,7 +909,21 @@ impl<'a> PartProcessor<'a> {
             );
         }
 
-        chunks.push(self.state.emit_delta("text_delta", json!({ "text": text })));
+        // [NEW] Output Scrubber / Persona Formatting
+        // Remove Google-specific phrases to maintain Claude/neutral persona
+        let mut scrubbed_text = text.to_string();
+        if scrubbed_text.contains("Google") {
+            scrubbed_text = scrubbed_text.replace("As an AI language model trained by Google", "As an AI language model");
+            scrubbed_text = scrubbed_text.replace("I am a large language model, trained by Google", "I am a large language model");
+            scrubbed_text = scrubbed_text.replace("I was trained by Google", "I am an AI");
+            scrubbed_text = scrubbed_text.replace("developed by Google", "developed by Anthropic"); // Spoofing for Claude clients
+            
+            if text.len() != scrubbed_text.len() {
+                tracing::debug!("[Streaming] Scrubber applied Google-persona filter on text block");
+            }
+        }
+
+        chunks.push(self.state.emit_delta("text_delta", json!({ "text": scrubbed_text })));
 
         chunks
     }
@@ -989,12 +953,10 @@ impl<'a> PartProcessor<'a> {
         }
 
         // [FIX #MCP] MCP tool name fuzzy matching
-        // Gemini often hallucinates incorrect MCP tool names, e.g.:
-        //   "mcp__puppeteer_navigate" instead of "mcp__puppeteer__puppeteer_navigate"
-        // We attempt to find the closest registered tool name.
-        if tool_name.starts_with("mcp__") && !self.state.registered_tool_names.is_empty() {
-            if !self.state.registered_tool_names.contains(&tool_name) {
-                if let Some(matched) = fuzzy_match_mcp_tool(&tool_name, &self.state.registered_tool_names) {
+        if tool_name.starts_with("mcp__") && !self.state.tool_schemas.is_empty() {
+            if !self.state.tool_schemas.contains_key(&tool_name) {
+                let tool_names: Vec<String> = self.state.tool_schemas.keys().cloned().collect();
+                if let Some(matched) = fuzzy_match_mcp_tool(&tool_name, &tool_names) {
                     tracing::warn!(
                         "[FIX #MCP] Corrected MCP tool name: '{}' → '{}'",
                         tool_name, matched
@@ -1047,13 +1009,13 @@ impl<'a> PartProcessor<'a> {
 
             let tool_name_title = fc.name.clone();
             // [OPTIMIZED] Only rename if it's "search" which is a known hallucination.
-            // Avoid renaming "grep" to "Grep" if possible to protect signature,
-            // unless we're sure Grep is the standard.
             let mut final_tool_name = tool_name_title;
             if final_tool_name.to_lowercase() == "search" {
                 final_tool_name = "Grep".to_string();
             }
-            remap_function_call_args(&final_tool_name, &mut remapped_args);
+            
+            // Pass schemas for dynamic validation
+            remap_function_call_args(&final_tool_name, &mut remapped_args, &self.state.tool_schemas);
 
             let json_str =
                 serde_json::to_string(&remapped_args).unwrap_or_else(|_| "{}".to_string());

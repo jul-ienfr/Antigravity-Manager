@@ -1,11 +1,12 @@
 {
-  "version": "4.1.30",
+  "version": "4.1.31",
   "name": "antigravity-tools",
   "type": "module",
   "private": true,
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "lint": "eslint src --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:debug": "RUST_LOG=debug npm run tauri dev"

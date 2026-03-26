@@ -20,72 +20,70 @@ use tracing::{debug, error};
 // [FIX] 全局待重新加载账号队列
 // 当 update_account_quota 更新 protected_models 后，将账号 ID 加入此队列
 // TokenManager 在 get_token 时会检查并处理这些账号
-static PENDING_RELOAD_ACCOUNTS: OnceLock<std::sync::RwLock<HashSet<String>>> = OnceLock::new();
+static PENDING_RELOAD_ACCOUNTS: OnceLock<tokio::sync::RwLock<HashSet<String>>> = OnceLock::new();
 
 // [NEW] 全局待删除账号队列 (Issue #1477)
 // 当账号被删除后，将账号 ID 加入此队列，TokenManager 在 get_token 时会检查并清理内存缓存
-static PENDING_DELETE_ACCOUNTS: OnceLock<std::sync::RwLock<HashSet<String>>> = OnceLock::new();
+static PENDING_DELETE_ACCOUNTS: OnceLock<tokio::sync::RwLock<HashSet<String>>> = OnceLock::new();
 
-fn get_pending_reload_accounts() -> &'static std::sync::RwLock<HashSet<String>> {
-    PENDING_RELOAD_ACCOUNTS.get_or_init(|| std::sync::RwLock::new(HashSet::new()))
+fn get_pending_reload_accounts() -> &'static tokio::sync::RwLock<HashSet<String>> {
+    PENDING_RELOAD_ACCOUNTS.get_or_init(|| tokio::sync::RwLock::new(HashSet::new()))
 }
 
-fn get_pending_delete_accounts() -> &'static std::sync::RwLock<HashSet<String>> {
-    PENDING_DELETE_ACCOUNTS.get_or_init(|| std::sync::RwLock::new(HashSet::new()))
+fn get_pending_delete_accounts() -> &'static tokio::sync::RwLock<HashSet<String>> {
+    PENDING_DELETE_ACCOUNTS.get_or_init(|| tokio::sync::RwLock::new(HashSet::new()))
 }
 
 /// 触发账号重新加载信号（供 update_account_quota 调用）
 pub fn trigger_account_reload(account_id: &str) {
-    if let Ok(mut pending) = get_pending_reload_accounts().write() {
-        pending.insert(account_id.to_string());
+    let account_id = account_id.to_string();
+    tokio::spawn(async move {
+        let mut pending = get_pending_reload_accounts().write().await;
+        pending.insert(account_id.clone());
         tracing::debug!(
             "[Quota] Queued account {} for TokenManager reload",
             account_id
         );
-    }
+    });
 }
 
 /// 触发账号删除信号 (Issue #1477)
 pub fn trigger_account_delete(account_id: &str) {
-    if let Ok(mut pending) = get_pending_delete_accounts().write() {
-        pending.insert(account_id.to_string());
+    let account_id_clone = account_id.to_string();
+    tokio::spawn(async move {
+        let mut pending = get_pending_delete_accounts().write().await;
+        pending.insert(account_id_clone.clone());
         tracing::debug!(
             "[Proxy] Queued account {} for cache removal",
-            account_id
+            account_id_clone
         );
-    }
+    });
 }
 
 /// 获取并清空待重新加载的账号列表（供 TokenManager 调用）
-pub fn take_pending_reload_accounts() -> Vec<String> {
-    if let Ok(mut pending) = get_pending_reload_accounts().write() {
-        let accounts: Vec<String> = pending.drain().collect();
-        if !accounts.is_empty() {
-            tracing::debug!(
-                "[Quota] Taking {} pending accounts for reload",
-                accounts.len()
-            );
-        }
-        accounts
-    } else {
-        Vec::new()
+pub async fn take_pending_reload_accounts() -> Vec<String> {
+    let mut pending = get_pending_reload_accounts().write().await;
+    let accounts: Vec<String> = pending.drain().collect();
+    if !accounts.is_empty() {
+        tracing::debug!(
+            "[Quota] Taking {} pending accounts for reload",
+            accounts.len()
+        );
     }
+    accounts
 }
 
 /// 获取并清空待删除的账号列表 (Issue #1477)
-pub fn take_pending_delete_accounts() -> Vec<String> {
-    if let Ok(mut pending) = get_pending_delete_accounts().write() {
-        let accounts: Vec<String> = pending.drain().collect();
-        if !accounts.is_empty() {
-            tracing::debug!(
-                "[Proxy] Taking {} pending accounts for cache removal",
-                accounts.len()
-            );
-        }
-        accounts
-    } else {
-        Vec::new()
+pub async fn take_pending_delete_accounts() -> Vec<String> {
+    let mut pending = get_pending_delete_accounts().write().await;
+    let accounts: Vec<String> = pending.drain().collect();
+    if !accounts.is_empty() {
+        tracing::debug!(
+            "[Proxy] Taking {} pending accounts for cache removal",
+            accounts.len()
+        );
     }
+    accounts
 }
 
 /// Axum 应用状态
@@ -671,6 +669,7 @@ impl AxumServer {
             .merge(proxy_routes)
             // 公开路由 (无需鉴权)
             .route("/auth/callback", get(handle_oauth_callback))
+            .route("/internal/smart_wrapper_log", post(crate::proxy::handlers::common::handle_smart_wrapper_log))
             // 应用全局监控与状态层 (外层)
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
@@ -719,35 +718,81 @@ impl AxumServer {
         };
 
         // 在新任务中启动服务器
+        
+        // --- NEW: Sniffer TLS Server on port 443 ---
+        let sniffer_app = axum::Router::new()
+            .route("/v1internal/*path", axum::routing::any(crate::proxy::handlers::sniffer::sniffer_handler))
+            .route("/v1internal", axum::routing::any(crate::proxy::handlers::sniffer::sniffer_handler));
+
+        tokio::spawn(async move {
+            use axum_server::tls_rustls::RustlsConfig;
+            use std::path::PathBuf;
+            let mut cert_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            cert_path.push("resources");
+            let mut key_path = cert_path.clone();
+            cert_path.push("cert.pem");
+            key_path.push("backend_key.pem");
+
+            if let Ok(config) = RustlsConfig::from_pem_file(&cert_path, &key_path).await {
+                tracing::info!("[SNIFFER] 🔒 Proxy TLS Transparent (Port 443) demarre pour auto-apprentissage !");
+                let _ = axum_server::bind_rustls("0.0.0.0:443".parse::<std::net::SocketAddr>().unwrap(), config)
+                    .serve(sniffer_app.into_make_service())
+                    .await;
+            } else {
+                tracing::error!("[SNIFFER] Impossible de charger cert.pem pour le port 443.");
+            }
+        });
+        // -------------------------------------------
+
         let handle = tokio::spawn(async move {
-            use hyper::server::conn::http1;
             use hyper_util::rt::TokioIo;
             use hyper_util::service::TowerToHyperService;
+            use hyper_util::server::conn::auto;
+
+            let tls_config = crate::proxy::tls::load_rustls_config();
+            let tls_acceptor = tls_config.map(|c| tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(c)));
 
             loop {
                 tokio::select! {
                     res = listener.accept() => {
                         match res {
                             Ok((stream, remote_addr)) => {
-                                let io = TokioIo::new(stream);
+                                let acceptor = tls_acceptor.clone();
+                                let app_clone = app.clone();
                                 
-                                // 注入 ConnectInfo (用于获取真实 IP)
-                                use tower::ServiceExt;
-                                use hyper::body::Incoming;
-                                let app_with_info = app.clone().map_request(move |mut req: axum::http::Request<Incoming>| {
-                                    req.extensions_mut().insert(axum::extract::ConnectInfo(remote_addr));
-                                    req
-                                });
-
-                                let service = TowerToHyperService::new(app_with_info);
-
                                 tokio::task::spawn(async move {
-                                    if let Err(err) = http1::Builder::new()
-                                        .serve_connection(io, service)
-                                        .with_upgrades() // 支持 WebSocket (如果以后需要)
-                                        .await
-                                    {
-                                        debug!("连接处理结束或出错: {:?}", err);
+                                    use tower::ServiceExt;
+                                    use hyper::body::Incoming;
+                                    
+                                    let app_with_info = app_clone.map_request(move |mut req: axum::http::Request<Incoming>| {
+                                        req.extensions_mut().insert(axum::extract::ConnectInfo(remote_addr));
+                                        req
+                                    });
+                                    let service = TowerToHyperService::new(app_with_info);
+
+                                    if let Some(tls) = acceptor {
+                                        match tls.accept(stream).await {
+                                            Ok(tls_stream) => {
+                                                let io = TokioIo::new(tls_stream);
+                                                if let Err(err) = auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                                                    .serve_connection_with_upgrades(io, service)
+                                                    .await
+                                                {
+                                                    debug!("TLS connection error: {:?}", err);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                debug!("TLS handshake failed: {:?}", e);
+                                            }
+                                        }
+                                    } else {
+                                        let io = TokioIo::new(stream);
+                                        if let Err(err) = auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                                            .serve_connection_with_upgrades(io, service)
+                                            .await
+                                        {
+                                            debug!("HTTP connection error: {:?}", err);
+                                        }
                                     }
                                 });
                             }
@@ -982,6 +1027,7 @@ async fn admin_delete_account(
     state
         .account_service
         .delete_account(&account_id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1082,7 +1128,7 @@ async fn admin_prepare_oauth_url(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let url = state
         .account_service
-        .prepare_oauth_url()
+        .prepare_oauth_url(None)
         .await
         .map_err(|e| {
             (
@@ -1098,7 +1144,7 @@ async fn admin_start_oauth_login(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let account = state
         .account_service
-        .start_oauth_login()
+        .start_oauth_login(None)
         .await
         .map_err(|e| {
             (
@@ -1478,7 +1524,9 @@ async fn admin_update_model_mapping(
 }
 
 async fn admin_generate_api_key() -> impl IntoResponse {
-    let new_key = format!("sk-{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
+    // Generate keys with the Anthropic official format "sk-ant-api03-" to bypass strict
+    // client-side validation in extensions like Claude Code for VS Code.
+    let new_key = format!("sk-ant-api03-{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
     Json(new_key)
 }
 
@@ -1684,11 +1732,13 @@ struct LogsFilterQuery {
 }
 
 async fn admin_get_proxy_logs_filtered(
+    State(state): State<AppState>,
     Query(params): Query<LogsFilterQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let filter_clone = params.filter.clone();
     let res = tokio::task::spawn_blocking(move || {
         crate::modules::proxy_db::get_logs_filtered(
-            &params.filter,
+            &filter_clone,
             params.errors_only,
             params.limit,
             params.offset,
@@ -1697,7 +1747,31 @@ async fn admin_get_proxy_logs_filtered(
     .await;
 
     match res {
-        Ok(Ok(logs)) => Ok(Json(logs)),
+        Ok(Ok(logs)) => {
+            if params.offset == 0 {
+                let active_map = state.monitor.active_requests.read().await;
+                let mut active_logs: Vec<_> = active_map.values().cloned().collect();
+                active_logs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                
+                if !params.filter.is_empty() {
+                    let f = params.filter.to_lowercase();
+                    active_logs.retain(|l| {
+                        l.url.to_lowercase().contains(&f)
+                            || l.method.to_lowercase().contains(&f)
+                            || l.model.as_deref().unwrap_or("").to_lowercase().contains(&f)
+                            || l.account_email.as_deref().unwrap_or("").to_lowercase().contains(&f)
+                    });
+                }
+                if params.errors_only {
+                    active_logs.retain(|l| l.status >= 400); // status 0 is pending, not error
+                }
+                
+                active_logs.extend(logs);
+                Ok(Json(active_logs))
+            } else {
+                Ok(Json(logs))
+            }
+        },
         Ok(Err(e)) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse { error: e }),
@@ -2190,7 +2264,7 @@ struct BulkDeleteRequest {
 async fn admin_delete_accounts(
     Json(payload): Json<BulkDeleteRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::modules::account::delete_accounts(&payload.account_ids).map_err(|e| {
+    crate::modules::account::delete_accounts(&payload.account_ids).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse { error: e }),
@@ -2209,7 +2283,7 @@ async fn admin_reorder_accounts(
     State(state): State<AppState>,
     Json(payload): Json<ReorderRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::modules::account::reorder_accounts(&payload.account_ids).map_err(|e| {
+    crate::modules::account::reorder_accounts(&payload.account_ids).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse { error: e }),
@@ -2248,7 +2322,7 @@ async fn admin_fetch_account_quota(
             )
         })?;
 
-    crate::modules::update_account_quota(&account_id, quota.clone()).map_err(|e| {
+    crate::modules::update_account_quota(&account_id, quota.clone()).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse { error: e }),
@@ -2275,6 +2349,7 @@ async fn admin_toggle_proxy_status(
         payload.enable,
         payload.reason.as_deref(),
     )
+    .await
     .map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2288,9 +2363,11 @@ async fn admin_toggle_proxy_status(
     Ok(StatusCode::OK)
 }
 
-async fn admin_warm_up_all_accounts() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)>
-{
-    let result = crate::commands::warm_up_all_accounts().await.map_err(|e| {
+async fn admin_warm_up_all_accounts(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state.token_manager.clear_all_model_not_found();
+    let result = crate::modules::quota::warm_up_all_accounts().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse { error: e }),
@@ -2300,9 +2377,11 @@ async fn admin_warm_up_all_accounts() -> Result<impl IntoResponse, (StatusCode, 
 }
 
 async fn admin_warm_up_account(
+    State(state): State<AppState>,
     Path(account_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let result = crate::commands::warm_up_account(account_id)
+    state.token_manager.clear_model_not_found(&account_id);
+    let result = crate::modules::quota::warm_up_account(&account_id)
         .await
         .map_err(|e| {
             (
@@ -2965,6 +3044,7 @@ async fn admin_prepare_oauth_url_web(
     let (auth_url, mut code_rx) = crate::modules::oauth_server::prepare_oauth_flow_manually(
         redirect_uri.clone(),
         state_str.clone(),
+        None,
     )
     .map_err(|e| {
         (
@@ -2983,7 +3063,7 @@ async fn admin_prepare_oauth_url_web(
                     "Consuming manually submitted OAuth code in background",
                 );
                 // 为 Web 回调提供简化的后端处理流程
-                match crate::modules::oauth::exchange_code(&code, &redirect_uri_clone).await {
+                match crate::modules::oauth::exchange_code(&code, &redirect_uri_clone, None).await {
                     Ok(token_resp) => {
                         // Success! Now add/upsert account
                         if let Some(refresh_token) = &token_resp.refresh_token {

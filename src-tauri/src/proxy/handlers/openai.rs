@@ -41,6 +41,54 @@ pub async fn handle_chat_completions(
     // 这确保了即使结构体定义遗漏字段，日志也能完整记录所有参数
     let original_body = body.clone();
 
+    // [TOKEN HARVESTER] Capture OAuth tokens passed by VS Code
+    if let Some(auth_header) = headers.get("authorization") {
+        if let Ok(auth_str) = auth_header.to_str() {
+            if auth_str.contains("ya29.") {
+                let token = auth_str.replace("Bearer ", "");
+                tracing::info!("[HACKER] 👁️ Token Harvester captured a new ya29 token!");
+                
+                
+                let auto_harvest = crate::modules::config::load_app_config()
+                    .map(|cfg| cfg.proxy.hacker.enable_auto_harvest)
+                    .unwrap_or(true);
+
+                if auto_harvest {
+                    // Use the LAST 8 characters to avoid collisions since they all start with ya29.
+                    let suffix = if token.len() > 8 { &token[token.len() - 8..] } else { &token };
+                    let email = format!("captured_{}@ya29.com", suffix);
+                    let token_data = crate::models::TokenData::new(
+                        token.clone(),
+                        "".to_string(),
+                        3599,
+                        Some(email.clone()),
+                        None,
+                        None
+                    );
+                    
+                    if let Err(e) = crate::modules::account::upsert_account(
+                        email.clone(), 
+                        Some("Hacked Token".to_string()), 
+                        token_data
+                    ).await {
+                        tracing::error!("Failed to save harvested token to accounts: {}", e);
+                    } else {
+                        tracing::info!("✅ Token harvested and saved as account: {}!", email);
+                        
+                        // Trigger a reload in the backend proxy pool asynchronously without blocking
+                        let state_clone = state.clone();
+                        tokio::spawn(async move {
+                            let _ = state_clone.token_manager.reload_all_accounts().await;
+                            tracing::info!("🔄 Token pool reloaded to include new harvested token.");
+                        });
+                    }
+                } else {
+                    tracing::info!("Token harvest ignored because Auto Harvest is disabled in settings.");
+                }
+            }
+        }
+    }
+
     // [NEW] 自动检测并转换 Responses 格式
     // 如果请求包含 instructions 或 input 但没有 messages，则认为是 Responses 格式
     let is_responses_format = !body.get("messages").is_some()
@@ -92,6 +140,9 @@ pub async fn handle_chat_completions(
 
     let mut openai_req: OpenAIRequest = serde_json::from_value(body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid request: {}", e)))?;
+
+    // [HACKER EDITION] Appliquer les altérations du payload (God Mode, Amnesia, etc.)
+    crate::proxy::hacker::apply_hacks_to_openai_request(&mut openai_req);
 
     // Safety: Ensure messages is not empty
     if openai_req.messages.is_empty() {
@@ -154,6 +205,7 @@ pub async fn handle_chat_completions(
     let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size.saturating_add(1)).max(2);
 
     let mut last_error = String::new();
+    let mut last_status = StatusCode::SERVICE_UNAVAILABLE;
     let mut last_email: Option<String> = None;
 
     // 2. 模型路由解析 (移到循环外以支持在所有路径返回 X-Mapped-Model)
@@ -161,6 +213,8 @@ pub async fn handle_chat_completions(
         &openai_req.model,
         &*state.custom_mapping.read().await,
     );
+    
+    let mut accumulated_queue_duration: u64 = 0;
 
     for attempt in 0..max_attempts {
         // 将 OpenAI 工具转为 Value 数组以便探测联网
@@ -183,6 +237,7 @@ pub async fn handle_chat_completions(
 
         // 4. 获取 Token (使用准确的 request_type)
         // 关键：在重试尝试 (attempt > 0) 时强制轮换账号
+        let queue_start = std::time::Instant::now();
         let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
             .get_token(
                 &config.request_type,
@@ -194,16 +249,41 @@ pub async fn handle_chat_completions(
         {
             Ok(t) => t,
             Err(e) => {
-                // [FIX] Attach headers to error response for logging visibility
                 let headers = [("X-Mapped-Model", mapped_model.as_str())];
+                let e_lower = e.to_lowercase();
+                if e_lower.contains("invalid_grant") || e_lower.contains("unauthorized") {
+                    return Ok((
+                        StatusCode::UNAUTHORIZED,
+                        headers,
+                        Json(json!({
+                            "error": {
+                                "message": format!("Token error: {}", e),
+                                "type": "authentication_error",
+                                "param": null,
+                                "code": "invalid_grant"
+                            }
+                        })),
+                    )
+                        .into_response());
+                }
+
                 return Ok((
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    StatusCode::TOO_MANY_REQUESTS,
                     headers,
-                    format!("Token error: {}", e),
+                    Json(json!({
+                        "error": {
+                            "message": format!("Rate limited (proxy pool exhaustion): {}", e),
+                            "type": "rate_limit_error",
+                            "param": null,
+                            "code": "no_available_accounts"
+                        }
+                    })),
                 )
                     .into_response());
             }
         };
+        
+        accumulated_queue_duration += queue_start.elapsed().as_millis() as u64;
 
         // [NEW v4.1.29] 获取完整 Token 对象用于动态规格查询
         let proxy_token = token_manager.get_token_by_id(&account_id);
@@ -215,8 +295,69 @@ pub async fn handle_chat_completions(
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
         // 4. 转换请求 (返回内容包含 session_id 和 message_count)
-        let (gemini_body, session_id, message_count) =
+        let (mut gemini_body, session_id, message_count) =
             transform_openai_request(&openai_req, &project_id, &mapped_model, proxy_token.as_ref());
+
+        // [REQUEST SPLITTING START]
+        // If the user has custom tools AND wants Google Search
+        let has_custom_tools = openai_req.tools.as_ref().map_or(false, |t| !t.is_empty());
+        if has_custom_tools && config.inject_google_search {
+            tracing::info!("[{}] 🛡️ Request Splitting: Executing pre-flight Google Search because custom tools are present", trace_id);
+            
+            let mut preflight_body = gemini_body.clone();
+            if let Some(req_obj) = preflight_body.get_mut("request").and_then(|r| r.as_object_mut()) {
+                req_obj.insert("tools".to_string(), json!([{"googleSearch": {}}]));
+                req_obj.remove("toolConfig");
+            }
+            
+            let preflight_call = upstream.call_v1_internal_with_headers(
+                "generateContent",
+                &access_token,
+                preflight_body,
+                None,
+                std::collections::HashMap::new(),
+                Some(account_id.as_str())
+            ).await;
+
+            if let Ok(result) = preflight_call {
+                if let Ok(resp_json) = result.response.json::<Value>().await {
+                    let preflight_openai = crate::proxy::mappers::openai::transform_openai_response(&resp_json, None, 0);
+                    let mut extracted_text = String::new();
+                    if let Some(choice) = preflight_openai.choices.first() {
+                        if let Some(crate::proxy::mappers::openai::OpenAIContent::String(ref s)) = choice.message.content {
+                            extracted_text = s.clone();
+                        }
+                    }
+
+                    if !extracted_text.is_empty() {
+                        tracing::info!("[{}] 🛡️ Pre-flight search successful. Injecting context.", trace_id);
+                        if let Some(last_msg) = openai_req.messages.last_mut() {
+                            let injection = format!("\n\n[Web Search Context]\n{}", extracted_text);
+                            use crate::proxy::mappers::openai::{OpenAIContent, OpenAIContentBlock};
+                            if let Some(content) = &mut last_msg.content {
+                                match content {
+                                    OpenAIContent::String(s) => {
+                                        s.push_str(&injection);
+                                    }
+                                    OpenAIContent::Array(arr) => {
+                                        arr.push(OpenAIContentBlock::Text {
+                                            text: injection,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Re-transform the mutated request
+                        let (new_body, _, _) = transform_openai_request(&openai_req, &project_id, &mapped_model, proxy_token.as_ref());
+                        gemini_body = new_body;
+                    }
+                }
+            } else {
+                tracing::warn!("[{}] 🛡️ Pre-flight search failed. Continuing without web context.", trace_id);
+            }
+        }
+        // [REQUEST SPLITTING END]
 
         if debug_logger::is_enabled(&debug_cfg) {
             let payload = json!({
@@ -265,10 +406,9 @@ pub async fn handle_chat_completions(
         // [FIX #1522] Inject Anthropic Beta Headers for Claude models (OpenAI path)
         let mut extra_headers = std::collections::HashMap::new();
         if mapped_model.to_lowercase().contains("claude") {
-            extra_headers.insert(
-                "anthropic-beta".to_string(),
-                "claude-code-20250219".to_string(),
-            );
+            let client_beta = headers.get("anthropic-beta").and_then(|v| v.to_str().ok());
+            let sanitized = crate::proxy::common::utils::sanitize_anthropic_beta(client_beta);
+            extra_headers.insert("anthropic-beta".to_string(), sanitized);
             tracing::debug!(
                 "[{}] Injected Anthropic beta headers for Claude model (via OpenAI)",
                 trace_id
@@ -335,6 +475,8 @@ pub async fn handle_chat_completions(
         // [NEW] 提取实际请求的上游端点 URL，用于日志记录和排查
         let upstream_url = response.url().to_string();
         let status = response.status();
+        last_status = status; // [FIX] Store for loop exit fallback
+        let status_code = status.as_u16();
         if status.is_success() {
             // 5. 处理流式 vs 非流式
             if actual_stream {
@@ -368,6 +510,7 @@ pub async fn handle_chat_completions(
                     openai_req.model.clone(),
                     session_id,
                     message_count,
+                    openai_req.stream_options.as_ref().map(|o| o.include_usage).unwrap_or(false),
                 );
 
                 let mut first_data_chunk = None;
@@ -399,6 +542,25 @@ pub async fn handle_chat_completions(
                                 last_error = "Error event during peek".to_string();
                                 retry_this_account = true;
                                 break;
+                            }
+
+                            // [HACKER] Shadow Ban Bypass
+                            let is_shadow_bypass = crate::modules::config::load_app_config()
+                                .map(|c| c.proxy.hacker.enable_shadow_ban_bypass)
+                                .unwrap_or_default();
+                                
+                            if is_shadow_bypass {
+                                let low_text = text.to_lowercase();
+                                if low_text.contains("i am sorry") || low_text.contains("i cannot") || low_text.contains("je suis désolé") || low_text.contains("unable to") || low_text.contains("i apologize") || low_text.contains("as an ai") || low_text.contains("as a language model") || low_text.contains("je ne peux pas") {
+                                    tracing::warn!("[HACKER] 🛑 Censure détectée dans le stream. Déclenchement de l'Auto-Retry (Shadow Ban Bypass).");
+                                    last_error = "HACKER: Censure détectée (Auto-Retry)".to_string();
+                                    
+                                    // Muter la requête originelle pour le prochain passage de la boucle `attempt`
+                                    crate::proxy::hacker::apply_shadow_ban_mutation(&mut openai_req);
+                                    
+                                    retry_this_account = true;
+                                    break;
+                                }
                             }
 
                             // We found real data!
@@ -444,7 +606,7 @@ pub async fn handle_chat_completions(
                 if client_wants_stream {
                     // 客户端请求流式，返回 SSE
                     let body = Body::from_stream(combined_stream);
-                    return Ok(Response::builder()
+                    let mut resp = Response::builder()
                         .header("Content-Type", "text/event-stream")
                         .header("Cache-Control", "no-cache")
                         .header("Connection", "keep-alive")
@@ -453,7 +615,9 @@ pub async fn handle_chat_completions(
                         .header("X-Mapped-Model", &mapped_model)
                         .body(body)
                         .unwrap()
-                        .into_response());
+                        .into_response();
+                    resp.extensions_mut().insert(crate::proxy::middleware::monitor::QueueDuration(accumulated_queue_duration));
+                    return Ok(resp);
                 } else {
                     // 客户端请求非流式，但内部强制转为流式
                     // 收集流数据并聚合为 JSON
@@ -462,7 +626,7 @@ pub async fn handle_chat_completions(
                     match collect_stream_to_json(Box::pin(combined_stream)).await {
                         Ok(full_response) => {
                             info!("[{}] ✓ Stream collected and converted to JSON", trace_id);
-                            return Ok((
+                            let mut resp = (
                                 StatusCode::OK,
                                 [
                                     ("X-Account-Email", email.as_str()),
@@ -470,7 +634,9 @@ pub async fn handle_chat_completions(
                                 ],
                                 Json(full_response),
                             )
-                                .into_response());
+                                .into_response();
+                            resp.extensions_mut().insert(crate::proxy::middleware::monitor::QueueDuration(accumulated_queue_duration));
+                            return Ok(resp);
                         }
                         Err(e) => {
                             error!("[{}] Stream collection error: {}", trace_id, e);
@@ -491,7 +657,7 @@ pub async fn handle_chat_completions(
 
             let openai_response =
                 transform_openai_response(&gemini_resp, Some(&session_id), message_count);
-            return Ok((
+            let mut resp = (
                 StatusCode::OK,
                 [
                     ("X-Account-Email", email.as_str()),
@@ -499,7 +665,9 @@ pub async fn handle_chat_completions(
                 ],
                 Json(openai_response),
             )
-                .into_response());
+                .into_response();
+            resp.extensions_mut().insert(crate::proxy::middleware::monitor::QueueDuration(accumulated_queue_duration));
+            return Ok(resp);
         }
 
         // 处理特定错误并重试
@@ -1100,6 +1268,14 @@ pub async fn handle_completions(
                 messages.len()
             );
             obj.insert("messages".to_string(), json!(messages));
+
+            // [FIX] Support OpenClaw's options.tools format (Anthropic/Codex hybrid)
+            if let Some(options) = obj.get("options") {
+                if let Some(tools) = options.get("tools") {
+                    let tools_clone = tools.clone(); // Clone to avoid mutable borrowing conflict later
+                    obj.insert("tools".to_string(), tools_clone);
+                }
+            }
         }
     } else if already_normalized {
         tracing::debug!(
@@ -1137,6 +1313,7 @@ pub async fn handle_completions(
     let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size.saturating_add(1)).max(2);
 
     let mut last_error = String::new();
+    let mut last_status = StatusCode::SERVICE_UNAVAILABLE;
     let mut last_email: Option<String> = None;
 
     // 2. 模型路由解析 (移到循环外以支持在所有路径返回 X-Mapped-Model)
@@ -1182,10 +1359,20 @@ pub async fn handle_completions(
         {
             Ok(t) => t,
             Err(e) => {
+                let headers = [("X-Mapped-Model", mapped_model.clone())];
+                let e_lower = e.to_lowercase();
+                if e_lower.contains("invalid_grant") || e_lower.contains("unauthorized") {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        headers,
+                        format!("Token error: {}", e),
+                    ).into_response();
+                }
+
                 return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    [("X-Mapped-Model", mapped_model)],
-                    format!("Token error: {}", e),
+                    StatusCode::TOO_MANY_REQUESTS,
+                    headers,
+                    format!("Rate limited (proxy pool exhaustion): {}", e),
                 )
                     .into_response()
             }
@@ -1212,6 +1399,7 @@ pub async fn handle_completions(
                 .map(|a| a.len())
                 .unwrap_or(0)
         );
+        let _ = std::fs::write("c:\\Users\\julie\\Desktop\\AUCUN\\tmp_gemini_body_debug.json", serde_json::to_string_pretty(&gemini_body).unwrap_or_default());
 
         // [AUTO-CONVERSION] For Legacy/Codex as well
         let client_wants_stream = openai_req.stream;
@@ -1281,6 +1469,7 @@ pub async fn handle_completions(
                             openai_req.model.clone(),
                             session_id,
                             message_count,
+                            openai_req.stream_options.as_ref().map(|o| o.include_usage).unwrap_or(false),
                         )
                     };
 
@@ -1360,6 +1549,7 @@ pub async fn handle_completions(
                         openai_req.model.clone(),
                         session_id,
                         message_count,
+                        true, // Internal collector always wants usage
                     );
 
                     // Peek Logic (Repeated for safety/correctness on this stream type)

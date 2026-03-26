@@ -11,8 +11,30 @@ pub fn transform_openai_request(
     mapped_model: &str,
     token: Option<&ProxyToken>,
 ) -> (Value, String, usize) {
-    let session_id = crate::proxy::session_manager::SessionManager::extract_openai_session_id(request);
-    let message_count = request.messages.len();
+    let session_id =
+        crate::proxy::session_manager::SessionManager::extract_openai_session_id(request);
+        
+    // [FIX] Support OpenClaw's native input array format natively if messages is empty
+    let parsed_input_messages: Option<Vec<crate::proxy::mappers::openai::OpenAIMessage>> = if request.messages.is_empty() {
+        request.input.as_ref().and_then(|v| {
+            if let Some(arr) = v.as_array() {
+                let parsed: Result<Vec<crate::proxy::mappers::openai::OpenAIMessage>, _> = arr.iter().map(|item| serde_json::from_value(item.clone())).collect();
+                parsed.ok()
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+
+    let effective_messages: &[crate::proxy::mappers::openai::OpenAIMessage] = if let Some(ref parsed) = parsed_input_messages {
+        parsed.as_slice()
+    } else {
+        &request.messages
+    };
+
+    let message_count = effective_messages.len();
     // 将 OpenAI 工具转为 Value 数组以便探测
     let tools_val = request
         .tools
@@ -29,7 +51,7 @@ pub fn transform_openai_request(
         request.size.as_deref(),       // [NEW] Pass size parameter
         request.quality.as_deref(),    // [NEW] Pass quality parameter
         request.image_size.as_deref(), // [FIX] Pass imageSize parameter
-        None,  // body
+        None,                          // body
     );
 
     // [FIX] 仅当模型名称显式包含 "-thinking" 时才视为 Gemini 思维模型
@@ -37,12 +59,10 @@ pub fn transform_openai_request(
     // [FIX #1557] Allow "pro" models (e.g. gemini-3-pro, gemini-2.0-pro) to bypass thinking check
     // These models support thinking but do not have "-thinking" suffix
     let is_gemini_3_thinking = mapped_model_lower.contains("gemini")
-        && (
-            mapped_model_lower.contains("-thinking")
-                || mapped_model_lower.contains("gemini-2.0-pro")
-                || mapped_model_lower.contains("gemini-3-pro")
-                || mapped_model_lower.contains("gemini-3.1-pro")
-        )
+        && (mapped_model_lower.contains("-thinking")
+            || mapped_model_lower.contains("gemini-2.0-pro")
+            || mapped_model_lower.contains("gemini-3-pro")
+            || mapped_model_lower.contains("gemini-3.1-pro"))
         && !mapped_model_lower.contains("claude");
     // [FIX #2167] gemini-3-flash / gemini-3.1-flash 支持 thinking，functionCall 必须携带 thoughtSignature
     // [FEATURE] 同时注入 includeThoughts:true 使 Gemini 返回 thought:true chunk，客户端可显示思维链
@@ -52,16 +72,18 @@ pub fn transform_openai_request(
     let is_claude_thinking = mapped_model_lower.ends_with("-thinking");
     let is_thinking_model = is_gemini_3_thinking || is_claude_thinking || is_gemini_flash_thinking;
 
+    let is_vertex = mapped_model.starts_with("projects/") || !project_id.is_empty();
 
     // [NEW] 检查用户是否在请求中显式启用 thinking
-    let user_enabled_thinking = request.thinking.as_ref()
+    let user_enabled_thinking = request
+        .thinking
+        .as_ref()
         .map(|t| t.thinking_type.as_deref() == Some("enabled"))
         .unwrap_or(false);
-    let user_thinking_budget = request.thinking.as_ref()
-        .and_then(|t| t.budget_tokens);
+    let user_thinking_budget = request.thinking.as_ref().and_then(|t| t.budget_tokens);
 
     // [NEW] 检查历史消息是否兼容思维模型 (是否有 Assistant 消息缺失 reasoning_content)
-    let has_incompatible_assistant_history = request.messages.iter().any(|msg| {
+    let has_incompatible_assistant_history = effective_messages.iter().any(|msg| {
         msg.role == "assistant"
             && msg
                 .reasoning_content
@@ -69,26 +91,25 @@ pub fn transform_openai_request(
                 .map(|s| s.is_empty())
                 .unwrap_or(true)
     });
-    let has_tool_history = request.messages.iter().any(|msg| {
-        msg.role == "tool" || msg.role == "function" || msg.tool_calls.is_some()
-    });
-
-
+    let has_tool_history = effective_messages
+        .iter()
+        .any(|msg| msg.role == "tool" || msg.role == "function" || msg.tool_calls.is_some());
 
     // [NEW] 决定是否开启 Thinking 功能:
     // 1. 模型名包含 -thinking 时自动开启
     // 2. 用户在请求中显式设置 thinking.type = "enabled" 时开启
     // 如果是 Claude 思考模型且历史不兼容且没有可用签名来占位, 则禁用 Thinking 以防 400
     let mut actual_include_thinking = is_thinking_model || user_enabled_thinking;
-    
+
     // [REFACTORED] 使用 SignatureCache 获取 Session 级别的签名
-    let session_thought_sig = crate::proxy::SignatureCache::global().get_session_signature(&session_id);
-    
+    let session_thought_sig =
+        crate::proxy::SignatureCache::global().get_session_signature(&session_id);
+
     if is_claude_thinking && has_incompatible_assistant_history && session_thought_sig.is_none() {
         tracing::warn!("[OpenAI-Thinking] Incompatible assistant history detected for Claude thinking model without session signature. Disabling thinking for this request to avoid 400 error. (sid: {})", session_id);
         actual_include_thinking = false;
     }
-    
+
     // [NEW] 日志：用户显式设置 thinking
     if user_enabled_thinking {
         tracing::info!(
@@ -106,8 +127,7 @@ pub fn transform_openai_request(
     );
 
     // 1. 提取所有 System Message 并注入补丁
-    let mut system_instructions: Vec<String> = request
-        .messages
+    let mut system_instructions: Vec<String> = effective_messages
         .iter()
         .filter(|msg| msg.role == "system" || msg.role == "developer")
         .filter_map(|msg| {
@@ -137,7 +157,7 @@ pub fn transform_openai_request(
 
     // Pre-scan to map tool_call_id to function name (for Codex)
     let mut tool_id_to_name = std::collections::HashMap::new();
-    for msg in &request.messages {
+    for msg in effective_messages {
         if let Some(tool_calls) = &msg.tool_calls {
             for call in tool_calls {
                 let name = &call.function.name;
@@ -183,8 +203,7 @@ pub fn transform_openai_request(
     }
 
     // 2. 构建 Gemini contents (过滤掉 system/developer 指令)
-    let contents: Vec<Value> = request
-        .messages
+    let contents: Vec<Value> = effective_messages
         .iter()
         .filter(|msg| msg.role != "system" && msg.role != "developer")
         .map(|msg| {
@@ -220,7 +239,7 @@ pub fn transform_openai_request(
                 
                 // [FIX #1575] 占位符永远不能使用真实签名（签名与真实思考内容绑定）
                 // 仅 Gemini 支持哨兵值跳过验证
-                if is_gemini_3_thinking {
+                if is_gemini_3_thinking && !is_vertex {
                     thought_part["thoughtSignature"] = json!("skip_thought_signature_validator");
                 }
                 
@@ -304,6 +323,39 @@ pub fn transform_openai_request(
                                     // 这会与 v3.3.16 的 thinkingConfig 逻辑冲突，留待后续版本实现
                                     tracing::debug!("[OpenAI-Request] Skipping audio_url (not yet implemented in v3.3.16)");
                                 }
+                                OpenAIContentBlock::ToolResult { tool_use_id, content } => {
+                                    let name = tool_id_to_name.get(tool_use_id).map(|s| s.as_str()).unwrap_or("unknown");
+                                    let content_str = match content {
+                                        Some(serde_json::Value::String(s)) => s.clone(),
+                                        Some(v) => serde_json::to_string(v).unwrap_or_default(),
+                                        None => "".to_string(),
+                                    };
+                                    parts.push(json!({
+                                        "functionResponse": {
+                                            "name": name,
+                                            "response": { "result": content_str }
+                                        }
+                                    }));
+                                }
+                                OpenAIContentBlock::ToolUse { id, name, input } => {
+                                    let mut args_obj = input.clone();
+                                    crate::proxy::common::json_schema::clean_json_schema(&mut args_obj);
+                                    let mut fc = json!({
+                                        "functionCall": {
+                                            "name": name,
+                                            "args": args_obj
+                                        }
+                                    });
+                                    if is_thinking_model || is_gemini_flash_thinking {
+                                        let is_vertex = mapped_model.starts_with("projects/") || !project_id.is_empty();
+                                        if !is_vertex {
+                                            tracing::debug!("[OpenAI-Signature] Adding GEMINI_SKIP_SIGNATURE for tool_use: {}", id);
+                                            fc["thoughtSignature"] = json!("skip_thought_signature_validator");
+                                        }
+                                    }
+                                    parts.push(fc);
+                                }
+                                OpenAIContentBlock::Unknown => {}
                             }
                         }
                     }
@@ -332,8 +384,7 @@ pub fn transform_openai_request(
                     let mut func_call_part = json!({
                         "functionCall": {
                             "name": if tc.function.name == "local_shell_call" { "shell" } else { &tc.function.name },
-                            "args": args,
-                            "id": &tc.id,
+                            "args": args
                         }
                     });
 
@@ -346,8 +397,11 @@ pub fn transform_openai_request(
                         // [NEW] Handle missing signature for Gemini thinking models
                         // [FIX #1650] Allow sentinel injection for Vertex AI (projects/...) as well
                         // [FIX #2167] Also applies to gemini-3-flash / gemini-3.1-flash
-                        tracing::debug!("[OpenAI-Signature] Adding GEMINI_SKIP_SIGNATURE for tool_use: {}", tc.id);
-                        func_call_part["thoughtSignature"] = json!("skip_thought_signature_validator");
+                        // [CRITICAL FIX] Do NOT use skip_thought_signature_validator for Vertex AI
+                        if !is_vertex {
+                            tracing::debug!("[OpenAI-Signature] Adding GEMINI_SKIP_SIGNATURE for tool_use: {}", tc.id);
+                            func_call_part["thoughtSignature"] = json!("skip_thought_signature_validator");
+                        }
                     }
 
                     parts.push(func_call_part);
@@ -396,8 +450,7 @@ pub fn transform_openai_request(
                 parts.push(json!({
                     "functionResponse": {
                        "name": final_name,
-                       "response": { "result": content_val },
-                       "id": msg.tool_call_id.clone().unwrap_or_default()
+                       "response": { "result": content_val }
                     }
                 }));
 
@@ -449,11 +502,11 @@ pub fn transform_openai_request(
 
     // [FIX] 移除旧的硬编码限额，改为动态查询 (v4.1.29)
     if let Some(max_tokens) = request.max_tokens {
-         gen_config["maxOutputTokens"] = json!(max_tokens);
+        gen_config["maxOutputTokens"] = json!(max_tokens);
     } else {
-         // 使用动态优先的规格限额
-         let limit = model_specs::get_max_output_tokens(mapped_model, token);
-         gen_config["maxOutputTokens"] = json!(limit);
+        // 使用动态优先的规格限额
+        let limit = model_specs::get_max_output_tokens(mapped_model, token);
+        gen_config["maxOutputTokens"] = json!(limit);
     }
 
     // [NEW] 支持多候选结果数量 (n -> candidateCount)
@@ -466,7 +519,8 @@ pub fn transform_openai_request(
         // [RESOLVE #1694] Check image thinking mode
         let image_thinking_mode = crate::proxy::config::get_image_thinking_mode();
         // Only disable if mode is explicitly "disabled" AND it's an image generation request
-        let is_image_gen_disabled = config.request_type == "image_gen" && image_thinking_mode == "disabled";
+        let is_image_gen_disabled =
+            config.request_type == "image_gen" && image_thinking_mode == "disabled";
 
         if is_image_gen_disabled {
             tracing::debug!("[OpenAI-Request] Image thinking mode disabled: enforcing includeThoughts=false for {}", mapped_model);
@@ -478,12 +532,12 @@ pub fn transform_openai_request(
             let tb_config = crate::proxy::config::get_thinking_budget_config();
             // 优先使用用户在请求中传入的 budget，否则从规格表中获取默认值
             let default_budget = model_specs::get_thinking_budget(mapped_model, token);
-            let user_budget: i64 = user_thinking_budget.map(|b| b as i64).unwrap_or(default_budget as i64);
-            
+            let user_budget: i64 = user_thinking_budget
+                .map(|b| b as i64)
+                .unwrap_or(default_budget as i64);
+
             let budget = match tb_config.mode {
-                crate::proxy::config::ThinkingBudgetMode::Passthrough => {
-                    user_budget
-                }
+                crate::proxy::config::ThinkingBudgetMode::Passthrough => user_budget,
                 crate::proxy::config::ThinkingBudgetMode::Custom => {
                     let mut custom_value = tb_config.custom_value as i64;
                     // 如果自定义值超过了模型规格上限，则进行裁剪
@@ -504,9 +558,7 @@ pub fn transform_openai_request(
                         user_budget
                     }
                 }
-                crate::proxy::config::ThinkingBudgetMode::Adaptive => {
-                    user_budget
-                }
+                crate::proxy::config::ThinkingBudgetMode::Adaptive => user_budget,
             };
 
             gen_config["thinkingConfig"] = json!({
@@ -516,24 +568,33 @@ pub fn transform_openai_request(
 
             // [CRITICAL] 思维模型的 maxOutputTokens 必须大于 thinkingBudget
             // [FIX #1675] 针对图像模型使用更保守的 max_tokens 增量，避免触发 128k 限制
-            let overhead = if config.request_type == "image_gen" { 2048 } else { 32768 };
-            let min_overhead = if config.request_type == "image_gen" { 1024 } else { 8192 };
+            let overhead = if config.request_type == "image_gen" {
+                2048
+            } else {
+                32768
+            };
+            let min_overhead = if config.request_type == "image_gen" {
+                1024
+            } else {
+                8192
+            };
 
             if let Some(max_tokens) = request.max_tokens {
-                 if (max_tokens as i64) <= budget {
-                     gen_config["maxOutputTokens"] = json!(budget + min_overhead);
-                 }
+                if (max_tokens as i64) <= budget {
+                    gen_config["maxOutputTokens"] = json!(budget + min_overhead);
+                }
             } else {
-                 // [FIX #1592] Use a more conservative default to avoid 400 error on 128k context models
-                 gen_config["maxOutputTokens"] = json!(budget + overhead);
+                // [FIX #1592] Use a more conservative default to avoid 400 error on 128k context models
+                gen_config["maxOutputTokens"] = json!(budget + overhead);
             }
-            
+
             let new_max = gen_config["maxOutputTokens"].as_i64().unwrap_or(0);
             tracing::debug!(
                 "[OpenAI-Request] Adjusted maxOutputTokens to {} for thinking model (budget={})",
-                new_max, budget
+                new_max,
+                budget
             );
-            
+
             tracing::debug!(
                 "[OpenAI-Request] Injected thinkingConfig for model {}: thinkingBudget={} (mode={:?})",
                 mapped_model, budget, tb_config.mode
@@ -586,7 +647,10 @@ pub fn transform_openai_request(
                 func
             };
 
-            let name_opt = gemini_func.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let name_opt = gemini_func
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
             if let Some(name) = &name_opt {
                 // 跳过内置联网工具名称，避免重复定义
@@ -604,9 +668,12 @@ pub fn transform_openai_request(
                     }
                 }
             } else {
-                 // [FIX] 如果工具没有名称，视为无效工具直接跳过 (防止 REQUIRED_FIELD_MISSING)
-                 tracing::warn!("[OpenAI-Request] Skipping tool without name: {:?}", gemini_func);
-                 continue;
+                // [FIX] 如果工具没有名称，视为无效工具直接跳过 (防止 REQUIRED_FIELD_MISSING)
+                tracing::warn!(
+                    "[OpenAI-Request] Skipping tool without name: {:?}",
+                    gemini_func
+                );
+                continue;
             }
 
             // [NEW CRITICAL FIX] 清除函数定义根层级的非法字段 (解决报错持久化)
@@ -618,9 +685,9 @@ pub fn transform_openai_request(
                 obj.remove("external_web_access"); // [FIX #1278] Remove invalid field injected by OpenAI Codex
             }
 
-            if let Some(params) = gemini_func.get_mut("parameters") {
+            if let Some(mut params) = gemini_func.get_mut("parameters").map(|v| v.clone()).or_else(|| gemini_func.get("input_schema").map(|v| v.clone())) {
                 // [DEEP FIX] 统一调用公共库清洗：展开 $ref 并剔除所有层级的 format/definitions
-                crate::proxy::common::json_schema::clean_json_schema(params);
+                crate::proxy::common::json_schema::clean_json_schema(&mut params);
 
                 // Gemini v1internal 要求：
                 // 1. type 必须是大写 (OBJECT, STRING 等)
@@ -632,7 +699,12 @@ pub fn transform_openai_request(
                 }
 
                 // 递归转换 type 为大写 (符合 Protobuf 定义)
-                enforce_uppercase_types(params);
+                enforce_uppercase_types(&mut params);
+                
+                if let Some(obj) = gemini_func.as_object_mut() {
+                    obj.insert("parameters".to_string(), params);
+                    obj.remove("input_schema");
+                }
             } else {
                 // [FIX] 针对自定义工具 (如 apply_patch) 补全缺失的参数模式
                 // 解决 Vertex AI (Claude) 报错: tools.5.custom.input_schema: Field required
@@ -663,9 +735,9 @@ pub fn transform_openai_request(
 
         if !function_declarations.is_empty() {
             inner_request["tools"] = json!([{ "functionDeclarations": function_declarations }]);
-            // [ADDED v4.1.24] toolConfig VALIDATED - aligns with native behavior
+            // [ADDED v4.1.24] toolConfig AUTO - aligns with native behavior
             inner_request["toolConfig"] = json!({
-                "functionCallingConfig": { "mode": "VALIDATED" }
+                "functionCallingConfig": { "mode": "AUTO" }
             });
         }
     }
@@ -705,7 +777,10 @@ pub fn transform_openai_request(
     });
 
     if config.inject_google_search {
-        crate::proxy::mappers::common_utils::inject_google_search_tool(&mut inner_request, Some(mapped_model));
+        crate::proxy::mappers::common_utils::inject_google_search_tool(
+            &mut inner_request,
+            Some(mapped_model),
+        );
     }
 
     if let Some(image_config) = config.image_config {
@@ -725,8 +800,15 @@ pub fn transform_openai_request(
 
     // [ADDED v4.1.24] 注入稳定 sessionId 对齐官方规范
     if let Some(t) = token {
-        inner_request["sessionId"] = json!(crate::proxy::common::session::derive_session_id(&t.account_id));
+        inner_request["sessionId"] = json!(crate::proxy::common::session::derive_session_id(
+            &t.account_id
+        ));
     }
+
+    // [HACKER] Furtivité Avancée (Stealth Mode)
+    let is_stealth = crate::modules::config::load_app_config()
+        .map(|c| c.proxy.hacker.enable_advanced_stealth)
+        .unwrap_or_default();
 
     let final_body = json!({
         "project": project_id,
@@ -789,18 +871,24 @@ mod tests {
         };
 
         // Auto mode (default) should cap gemini-3-pro thinking budget to 24576
-        let (result, _sid, _msg_count) = transform_openai_request(&req, "test-v", "gemini-3-pro", None);
+        let (result, _sid, _msg_count) =
+            transform_openai_request(&req, "test-v", "gemini-3-pro", None);
         let budget = result["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"]
             .as_i64()
             .unwrap();
-        assert_eq!(budget, 24576, "Gemini-3-pro budget must be capped to 24576 in Auto mode");
+        assert_eq!(
+            budget, 24576,
+            "Gemini-3-pro budget must be capped to 24576 in Auto mode"
+        );
     }
 
     #[test]
     fn test_issue_1602_custom_mode_gemini_capping() {
         // [FIX #1602] Regression test for custom mode capping
-        use crate::proxy::config::{ThinkingBudgetConfig, ThinkingBudgetMode, update_thinking_budget_config};
-        
+        use crate::proxy::config::{
+            update_thinking_budget_config, ThinkingBudgetConfig, ThinkingBudgetMode,
+        };
+
         // 设置自定义模式，且数值超过 24k
         update_thinking_budget_config(ThinkingBudgetConfig {
             mode: ThinkingBudgetMode::Custom,
@@ -832,16 +920,22 @@ mod tests {
         };
 
         // 验证针对 Gemini 模型即使是 Custom 模式也会被修正为 24576
-        let (result, _sid, _msg_count) = transform_openai_request(&req, "test-v", "gemini-2.0-flash-thinking", None);
+        let (result, _sid, _msg_count) =
+            transform_openai_request(&req, "test-v", "gemini-2.0-flash-thinking", None);
         let budget = result["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"]
             .as_i64()
             .unwrap();
-        assert_eq!(budget, 24576, "Gemini custom budget must be capped to 24576");
+        assert_eq!(
+            budget, 24576,
+            "Gemini custom budget must be capped to 24576"
+        );
 
         // 验证非 Gemini 模型（如 Claude 原生路径，假设映射后名不含 gemini）则不应截断
         // 注意：这里的 transform_openai_request 第三个参数是 mapped_model
-        let (result_claude, _, _) = transform_openai_request(&req, "test-v", "claude-3-7-sonnet", None);
-        let budget_claude = result_claude["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"]
+        let (result_claude, _, _) =
+            transform_openai_request(&req, "test-v", "claude-3-7-sonnet", None);
+        let budget_claude = result_claude["request"]["generationConfig"]["thinkingConfig"]
+            ["thinkingBudget"]
             .as_i64();
         // 如果不是 gemini 模型且协议中没带 thinking 配置，可能会是 None 或 32000
         // 在该测试环境下，由于模拟的是 OpenAI 格式转 Gemini 路径，如果没有 gemini 关键词通常不进入 thinking 逻辑
@@ -882,7 +976,8 @@ mod tests {
             ..Default::default()
         };
 
-        let (result, _sid, _msg_count) = transform_openai_request(&req, "test-v", "gemini-1.5-flash", None);
+        let (result, _sid, _msg_count) =
+            transform_openai_request(&req, "test-v", "gemini-1.5-flash", None);
         let parts = &result["request"]["contents"][0]["parts"];
         assert_eq!(parts.as_array().unwrap().len(), 2);
         assert_eq!(parts[0]["text"].as_str().unwrap(), "What is in this image?");
@@ -891,7 +986,7 @@ mod tests {
             "image/png"
         );
     }
-    
+
     #[test]
     fn test_gemini_pro_thinking_injection() {
         let req = OpenAIRequest {
@@ -924,13 +1019,19 @@ mod tests {
         };
 
         // Pass explicit gemini-3-pro-preview which doesn't have "-thinking" suffix
-        let (result, _sid, _msg_count) = transform_openai_request(&req, "test-p", "gemini-3-pro-preview", None);
+        let (result, _sid, _msg_count) =
+            transform_openai_request(&req, "test-p", "gemini-3-pro-preview", None);
         let gen_config = &result["request"]["generationConfig"];
-        
+
         // Assert thinkingConfig is present (fix verification)
-        assert!(gen_config.get("thinkingConfig").is_some(), "thinkingConfig should be injected for gemini-3-pro");
-        
-        let budget = gen_config["thinkingConfig"]["thinkingBudget"].as_u64().unwrap();
+        assert!(
+            gen_config.get("thinkingConfig").is_some(),
+            "thinkingConfig should be injected for gemini-3-pro"
+        );
+
+        let budget = gen_config["thinkingConfig"]["thinkingBudget"]
+            .as_u64()
+            .unwrap();
         // Should use user budget (16000) or capped valid default
         assert_eq!(budget, 16000);
     }
@@ -950,14 +1051,21 @@ mod tests {
         };
 
         // Pass gemini-3-pro-image which matches "gemini-3-pro" substring
-        let (result, _sid, _msg_count) = transform_openai_request(&req, "test-p", "gemini-3-pro-image", None);
+        let (result, _sid, _msg_count) =
+            transform_openai_request(&req, "test-p", "gemini-3-pro-image", None);
         let gen_config = &result["request"]["generationConfig"];
-        
+
         // Assert thinkingConfig IS present (based on latest user feedback)
-        assert!(gen_config.get("thinkingConfig").is_some(), "thinkingConfig SHOULD be injected for gemini-3-pro-image");
-        
+        assert!(
+            gen_config.get("thinkingConfig").is_some(),
+            "thinkingConfig SHOULD be injected for gemini-3-pro-image"
+        );
+
         // Assert imageConfig is present
-        assert!(gen_config.get("imageConfig").is_some(), "imageConfig should be present for image models");
+        assert!(
+            gen_config.get("imageConfig").is_some(),
+            "imageConfig should be present for image models"
+        );
         assert_eq!(gen_config["imageConfig"]["imageSize"], "4K");
     }
 
@@ -986,14 +1094,17 @@ mod tests {
             ..Default::default()
         };
 
-        let (result, _sid, _msg_count) = transform_openai_request(&req, "test-p", "gemini-3-pro-high-thinking", None);
+        let (result, _sid, _msg_count) =
+            transform_openai_request(&req, "test-p", "gemini-3-pro-high-thinking", None);
         let gen_config = &result["request"]["generationConfig"];
         let max_output_tokens = gen_config["maxOutputTokens"].as_i64().unwrap();
         // budget(24576) + overhead(32768) = 57344
         assert_eq!(max_output_tokens, 57344);
-        
+
         // Verify thinkingBudget
-        let budget = gen_config["thinkingConfig"]["thinkingBudget"].as_i64().unwrap();
+        let budget = gen_config["thinkingConfig"]["thinkingBudget"]
+            .as_i64()
+            .unwrap();
         // actual(24576)
         assert_eq!(budget, 24576);
     }
@@ -1030,11 +1141,14 @@ mod tests {
         };
 
         // Test with Flash model
-        let (result, _sid, _msg_count) = transform_openai_request(&req, "test-p", "gemini-2.0-flash-thinking-exp", None);
+        let (result, _sid, _msg_count) =
+            transform_openai_request(&req, "test-p", "gemini-2.0-flash-thinking-exp", None);
         let gen_config = &result["request"]["generationConfig"];
-        
+
         // Should be capped at 24576
-        let budget = gen_config["thinkingConfig"]["thinkingBudget"].as_i64().unwrap();
+        let budget = gen_config["thinkingConfig"]["thinkingBudget"]
+            .as_i64()
+            .unwrap();
         assert_eq!(budget, 24576);
 
         // Max output tokens should be adjusted based on capped budget (24576 + 8192)
@@ -1068,17 +1182,24 @@ mod tests {
 
         // Simulate Vertex AI path
         let mapped_model = "projects/my-project/locations/us-central1/publishers/google/models/gemini-2.0-flash-thinking-exp";
-        
-        let (result, _sid, _msg_count) = transform_openai_request(&req, "test-v", mapped_model, None);
-        
+
+        let (result, _sid, _msg_count) =
+            transform_openai_request(&req, "test-v", mapped_model, None);
+
         // Extract the tool call part from contents
-        let contents = result["contents"].as_array().unwrap();
+        let contents = result["request"]["contents"].as_array().unwrap();
         // Identify the part with functionCall
         let parts = contents[0]["parts"].as_array().unwrap();
-        let tool_part = parts.iter().find(|p| p.get("functionCall").is_some()).expect("Should find functionCall part");
-        
+        let tool_part = parts
+            .iter()
+            .find(|p| p.get("functionCall").is_some())
+            .expect("Should find functionCall part");
+
         // Vertex AI requires sentinel
-        assert_eq!(tool_part["thoughtSignature"].as_str(), Some("skip_thought_signature_validator"));
+        assert_eq!(
+            tool_part["thoughtSignature"].as_str(),
+            Some("skip_thought_signature_validator")
+        );
     }
 
     #[test]
@@ -1105,11 +1226,17 @@ mod tests {
                 ..Default::default()
             };
 
-            let (result, _sid, _msg_count) = transform_openai_request(&req, "test-proj", model, None);
+            let (result, _sid, _msg_count) =
+                transform_openai_request(&req, "test-proj", model, None);
 
-            let contents = result["request"]["contents"].as_array().expect("Should have request.contents");
+            let contents = result["request"]["contents"]
+                .as_array()
+                .expect("Should have request.contents");
             // flash 模型的 assistant role → Gemini "model" role
-            let model_msg = contents.iter().find(|c| c["role"] == "model").expect("Should find model role message");
+            let model_msg = contents
+                .iter()
+                .find(|c| c["role"] == "model")
+                .expect("Should find model role message");
             let parts = model_msg["parts"].as_array().expect("Should have parts");
             let tool_part = parts
                 .iter()
@@ -1147,14 +1274,17 @@ mod tests {
         };
 
         // 2. Transform request
-        let (result, _sid, _msg_count) = transform_openai_request(&req, "test-proj", "gemini-3-pro-image", None);
+        let (result, _sid, _msg_count) =
+            transform_openai_request(&req, "test-proj", "gemini-3-pro-image", None);
 
         // 3. Verify thinkingConfig has includeThoughts: false
-        let gen_config = result["request"]["generationConfig"].as_object().expect("Should have generationConfig in request payload");
+        let gen_config = result["request"]["generationConfig"]
+            .as_object()
+            .expect("Should have generationConfig in request payload");
         let thinking_config = gen_config["thinkingConfig"].as_object().unwrap();
-        
+
         assert_eq!(thinking_config["includeThoughts"], false);
-        
+
         // 4. Reset global mode
         crate::proxy::config::update_image_thinking_mode(Some("enabled".to_string()));
     }
@@ -1189,13 +1319,80 @@ mod tests {
 
         // 使用 gemini-2.0-flash 模型执行转换
         let (result, _, _) = transform_openai_request(&req, "proj", "gemini-2.0-flash", None);
-        
-        let tools = result["request"]["tools"].as_array().expect("Should have tools");
-        
-        let has_functions = tools.iter().any(|t| t.get("functionDeclarations").is_some());
+
+        let tools = result["request"]["tools"]
+            .as_array()
+            .expect("Should have tools");
+
+        let has_functions = tools
+            .iter()
+            .any(|t| t.get("functionDeclarations").is_some());
         let has_google_search = tools.iter().any(|t| t.get("googleSearch").is_some());
-        
+
         assert!(has_functions, "Should contain functionDeclarations");
-        assert!(has_google_search, "Should contain googleSearch (Gemini 2.0+ supports mixed tools)");
+        assert!(
+            has_google_search,
+            "Should contain googleSearch (Gemini 2.0+ supports mixed tools)"
+        );
+    }
+
+    #[test]
+    fn test_openclaw_payload_dump() {
+        use serde_json::json;
+        let payload = json!({
+            "model": "gemini-3.1-pro-high",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are OpenClaw."
+                },
+                {
+                    "role": "user",
+                    "content": "ls -la /"
+                },
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_123",
+                            "type": "function",
+                            "function": {
+                                "name": "exec",
+                                "arguments": "{\"command\":\"ls -la /\"}"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_123",
+                            "content": "total 772\ndrwxr-xr-x..."
+                        }
+                    ]
+                }
+            ],
+            "tools": [
+                {
+                  "type": "function",
+                  "name": "exec",
+                  "description": "Execute shell commands",
+                  "parameters": {
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {
+                      "command": { "type": "string" }
+                    }
+                  }
+                }
+            ]
+        });
+
+        let openai_req: OpenAIRequest = serde_json::from_value(payload).unwrap();
+        let (gemini_body, _, _) = transform_openai_request(&openai_req, "proj_123", "gemini-3.1-pro-high", None);
+        
+        std::fs::write("dump.json", serde_json::to_string_pretty(&gemini_body).unwrap()).unwrap();
     }
 }

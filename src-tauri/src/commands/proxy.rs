@@ -120,7 +120,7 @@ pub async fn internal_start_proxy_service(
         }
     }
 
-    let _monitor = state.monitor.read().await.as_ref().unwrap().clone();
+    let _monitor = state.monitor.read().await.as_ref().ok_or("Monitor not initialized")?.clone();
 
     // 檢查並啟動管理服務器（如果尚未運行）
     ensure_admin_server(
@@ -136,7 +136,7 @@ pub async fn internal_start_proxy_service(
         let admin_lock = state.admin_server.read().await;
         admin_lock
             .as_ref()
-            .unwrap()
+            .ok_or("Admin server not initialized")?
             .axum_server
             .token_manager
             .clone()
@@ -146,6 +146,11 @@ pub async fn internal_start_proxy_service(
     token_manager.start_auto_cleanup().await;
     token_manager
         .update_sticky_config(config.scheduling.clone())
+        .await;
+
+    // [NEW] 同步预见性限流配置
+    token_manager
+        .update_predictive_config(config.predictive_limits.clone())
         .await;
 
     // [NEW] 加载熔断配置 (从主配置加载)
@@ -182,7 +187,7 @@ pub async fn internal_start_proxy_service(
 
     let mut instance_lock = state.instance.write().await;
     let admin_lock = state.admin_server.read().await;
-    let axum_server = admin_lock.as_ref().unwrap().axum_server.clone();
+    let axum_server = admin_lock.as_ref().ok_or("Admin server not initialized")?.axum_server.clone();
 
     // 创建服务实例（逻辑启动）
     let instance = ProxyServiceInstance {
@@ -231,7 +236,7 @@ pub async fn ensure_admin_server(
                 };
             *monitor_lock = Some(Arc::new(ProxyMonitor::new(1000, app_handle)));
         }
-        monitor_lock.as_ref().unwrap().clone()
+        monitor_lock.as_ref().ok_or("Monitor not initialized")?.clone()
     };
 
     // 默认空 TokenManager 用于管理界面
@@ -274,6 +279,8 @@ pub async fn ensure_admin_server(
     crate::proxy::update_global_system_prompt_config(config.global_system_prompt.clone());
     // [NEW] 初始化全局图像思维模式配置
     crate::proxy::update_image_thinking_mode(config.image_thinking_mode.clone());
+    // [NEW] 初始化全局 Hacker 配置
+    crate::proxy::config::update_hacker_config(config.hacker.clone());
 
     Ok(())
 }
@@ -463,7 +470,7 @@ pub async fn get_proxy_logs_filtered(
 /// 生成 API Key
 #[tauri::command]
 pub fn generate_api_key() -> String {
-    format!("sk-{}", uuid::Uuid::new_v4().simple())
+    format!("sk-ant-api03-{}", uuid::Uuid::new_v4().simple())
 }
 
 /// 重新加载账号（当主应用添加/删除账号时调用）
@@ -751,6 +758,19 @@ pub async fn clear_all_proxy_rate_limits(
     if let Some(instance) = instance_lock.as_ref() {
         instance.token_manager.clear_all_rate_limits();
         Ok(())
+    } else {
+        Err("服务未运行".to_string())
+    }
+}
+
+/// 获取限流器当前状态 (404/429)
+#[tauri::command]
+pub async fn get_rate_limit_status(
+    state: State<'_, ProxyServiceState>,
+) -> Result<crate::proxy::rate_limit::RateLimitStatus, String> {
+    let instance_lock = state.instance.read().await;
+    if let Some(instance) = instance_lock.as_ref() {
+        Ok(instance.token_manager.get_rate_limit_status())
     } else {
         Err("服务未运行".to_string())
     }

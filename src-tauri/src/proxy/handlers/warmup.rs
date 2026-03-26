@@ -240,6 +240,7 @@ pub async fn handle_warmup(
                 url: format!("/internal/warmup -> {}", req.model),
                 status: status_code,
                 duration,
+                queue_duration: None,
                 model: Some(req.model.clone()),
                 mapped_model: Some(req.model.clone()),
                 account_email: Some(req.email.clone()),
@@ -258,6 +259,7 @@ pub async fn handle_warmup(
                 output_tokens: Some(0),
                 protocol: Some("warmup".to_string()),
                 username: None,
+                user_agent: None,
             };
             state.monitor.log_request(log).await;
 
@@ -294,7 +296,7 @@ pub async fn handle_warmup(
                             "[Warmup-API] 403 Forbidden detected for {}, marking account as forbidden",
                             req.email
                         );
-                        let _ = crate::modules::account::mark_account_forbidden(&resolved_account_id, &error_text);
+                        let _ = crate::modules::account::mark_account_forbidden(&resolved_account_id, &error_text).await;
                     } else {
                         warn!(
                             "[Warmup-API] 403 Forbidden detected for {} but could not resolve account_id, skipping mark",
@@ -338,6 +340,7 @@ pub async fn handle_warmup(
                 url: format!("/internal/warmup -> {}", req.model),
                 status: 500,
                 duration,
+                queue_duration: None,
                 model: Some(req.model.clone()),
                 mapped_model: Some(req.model.clone()),
                 account_email: Some(req.email.clone()),
@@ -352,6 +355,7 @@ pub async fn handle_warmup(
                 output_tokens: None,
                 protocol: Some("warmup".to_string()),
                 username: None,
+                user_agent: None,
             };
             state.monitor.log_request(log).await;
 

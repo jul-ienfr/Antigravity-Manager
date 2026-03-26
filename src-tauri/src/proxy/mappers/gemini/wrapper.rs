@@ -1,5 +1,37 @@
 // Gemini v1internal 包装/解包
 use serde_json::{json, Value};
+use uuid::Uuid;
+
+fn inject_payload_metadata(val: &mut Value, meta: &crate::proxy::sniffed_profile::PayloadMetadataImpersonationConfig) {
+    match val {
+        Value::Object(map) => {
+            if map.contains_key("ideName") { map.insert("ideName".to_string(), json!(meta.ide_name.clone())); }
+            if map.contains_key("extensionName") { map.insert("extensionName".to_string(), json!(meta.extension_name.clone())); }
+            if map.contains_key("extensionVersion") { map.insert("extensionVersion".to_string(), json!(meta.extension_version.clone())); }
+            if map.contains_key("ideVersion") { map.insert("ideVersion".to_string(), json!(meta.ide_version.clone())); }
+            if map.contains_key("machineId") { map.insert("machineId".to_string(), json!(meta.machine_id.clone())); }
+            if map.contains_key("devDeviceId") { map.insert("devDeviceId".to_string(), json!(meta.dev_device_id.clone())); }
+            if map.contains_key("sessionId") && meta.session_id != "" { map.insert("sessionId".to_string(), json!(meta.session_id.clone())); }
+            if map.contains_key("sqmId") { map.insert("sqmId".to_string(), json!(meta.sqm_id.clone())); }
+            if map.contains_key("platform") { map.insert("platform".to_string(), json!(meta.platform.clone())); }
+            if map.contains_key("nodePlatform") { map.insert("nodePlatform".to_string(), json!(meta.node_platform.clone())); }
+            if map.contains_key("nodeArch") { map.insert("nodeArch".to_string(), json!(meta.node_arch.clone())); }
+            if map.contains_key("platformVersion") { map.insert("platformVersion".to_string(), json!(meta.platform_version.clone())); }
+            if map.contains_key("shellVersion") { map.insert("shellVersion".to_string(), json!(meta.shell_version.clone())); }
+            if map.contains_key("rendererVersion") { map.insert("rendererVersion".to_string(), json!(meta.renderer_version.clone())); }
+            
+            for v in map.values_mut() {
+                inject_payload_metadata(v, meta);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                inject_payload_metadata(v, meta);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// 包装请求体为 v1internal 格式
 pub fn wrap_request(
@@ -32,8 +64,64 @@ pub fn wrap_request(
     // 复制 body 以便修改
     let mut inner_request = body.clone();
 
+    // [STEALTH] Whitelist operation: Remove all unauthorized root fields
+    // This ensures no custom client fingerprints, signatures, or unknown fields 
+    // leak through to the Gemini API, maintaining absolute stealth.
+    if let Some(obj) = inner_request.as_object_mut() {
+        let allowed_keys: std::collections::HashSet<&str> = [
+            "contents", 
+            "tools", 
+            "toolConfig", 
+            "systemInstruction", 
+            "safetySettings", 
+            "generationConfig",
+            "cachedContent",
+            "labels",
+        ].iter().cloned().collect();
+        
+        obj.retain(|k, _| allowed_keys.contains(k.as_str()));
+    }
+
     // 深度清理 [undefined] 字符串 (Cherry Studio 等客户端常见注入)
     crate::proxy::mappers::common_utils::deep_clean_undefined(&mut inner_request, 0);
+
+    // [NEW] Sanitization: Merge consecutive identical roles to remove stale cache marks
+    if let Some(contents) = inner_request.get_mut("contents").and_then(|c| c.as_array_mut()) {
+        let mut merged: Vec<Value> = Vec::new();
+        for msg in contents.drain(..) {
+            if let (Some(last), Some(current_role)) = (merged.last_mut(), msg.get("role").and_then(|r| r.as_str())) {
+                if let Some(last_role) = last.get("role").and_then(|r| r.as_str()) {
+                    if last_role == current_role {
+                        if let (Some(last_parts), Some(current_parts)) = (
+                            last.get_mut("parts").and_then(|p| p.as_array_mut()),
+                            msg.get("parts").and_then(|p| p.as_array()),
+                        ) {
+                            last_parts.extend(current_parts.clone());
+                        }
+                        continue; // skip pushing to keep merged
+                    }
+                }
+            }
+            merged.push(msg);
+        }
+        *contents = merged;
+    }
+
+    // [NEW] Absolute Impersonation Payload Override
+    if let Some(mut config) = crate::proxy::sniffed_profile::get_impersonation_config() {
+        // [HYBRID FIX] 
+        // Force l'utilisation de l'empreinte spécifique du compte tout en gardant l'impersonation logicielle globale.
+        if let Some(acc_id) = account_id {
+            if let Ok(profiles) = crate::modules::account::get_device_profiles(acc_id) {
+                if let Some(profile) = profiles.bound_profile {
+                    config.payload_metadata.machine_id = profile.machine_id;
+                    config.payload_metadata.dev_device_id = profile.dev_device_id;
+                    config.payload_metadata.sqm_id = profile.sqm_id;
+                }
+            }
+        }
+        inject_payload_metadata(&mut inner_request, &config.payload_metadata);
+    }
 
     // [FIX #1522] Inject dummy IDs for Claude models in Gemini protocol
     // Google v1internal requires 'id' for tool calls when the model is Claude,
@@ -58,7 +146,7 @@ pub fn wrap_request(
                                 let name =
                                     fc.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
                                 let count = name_counters.entry(name.to_string()).or_insert(0);
-                                let call_id = format!("call_{}_{}", name, count);
+                                let call_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, format!("{}_{}", name, count).as_bytes()).to_string();
                                 *count += 1;
 
                                 fc.as_object_mut()
@@ -76,7 +164,7 @@ pub fn wrap_request(
                                 let name =
                                     fr.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
                                 let count = name_counters.entry(name.to_string()).or_insert(0);
-                                let call_id = format!("call_{}_{}", name, count);
+                                let call_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, format!("{}_{}", name, count).as_bytes()).to_string();
                                 *count += 1;
 
                                 fr.as_object_mut()
@@ -87,24 +175,37 @@ pub fn wrap_request(
                         }
 
                         // 3. 处理 thoughtSignature
+                        // [FIX thought_sig_v2] Restructured to ensure sentinel injection even when session_id is None
                         if obj.contains_key("functionCall") && obj.get("thoughtSignature").is_none()
                         {
-                            if let Some(s_id) = session_id {
+                            // Determine if this model requires a thoughtSignature
+                            let lower = final_model_name.to_lowercase();
+                            let is_thinking_model_wrap = lower.contains("gemini-3-flash")
+                                || lower.contains("gemini-3.1-flash")
+                                || lower.contains("gemini-3-pro")
+                                || lower.contains("gemini-3.1-pro")
+                                || lower.contains("gemini-2.0-pro")
+                                || lower.contains("-thinking");
+
+                            // Try to get real signature from session cache first
+                            let injected_real_sig = if let Some(s_id) = session_id {
                                 if let Some(sig) = crate::proxy::SignatureCache::global()
                                     .get_session_signature(s_id)
                                 {
                                     obj.insert("thoughtSignature".to_string(), json!(sig));
-                                    tracing::debug!("[Gemini-Wrap] Injected signature (len: {}) for session: {}", sig.len(), s_id);
+                                    tracing::debug!("[Gemini-Wrap] Injected real signature (len: {}) for session: {}", sig.len(), s_id);
+                                    true
                                 } else {
-                                    // [FIX #2167] Session 缓存为空时对 flash 模型注入哨兵值
-                                    // Flash 模型如果不提供任何签名，Gemini API 会拒绝 functionCall
-                                    let is_flash = final_model_name.to_lowercase().contains("gemini-3-flash")
-                                        || final_model_name.to_lowercase().contains("gemini-3.1-flash");
-                                    if is_flash {
-                                        obj.insert("thoughtSignature".to_string(), json!("skip_thought_signature_validator"));
-                                        tracing::debug!("[Gemini-Wrap] [FIX #2167] Injected sentinel signature for flash model (no session cache)");
-                                    }
+                                    false
                                 }
+                            } else {
+                                false
+                            };
+
+                            // Fallback: inject sentinel for thinking models when no real sig is available
+                            if !injected_real_sig && is_thinking_model_wrap {
+                                obj.insert("thoughtSignature".to_string(), json!("skip_thought_signature_validator"));
+                                tracing::debug!("[Gemini-Wrap] [FIX thought_sig] Sentinel injected for '{}' (no real sig available)", final_model_name);
                             }
                         }
                     }
@@ -502,10 +603,21 @@ pub fn wrap_request(
     }
 
     // [ADDED v4.1.24] 扩展 toolConfig 到 VALIDATED 模式
-    if inner_request.get("tools").is_some() && !inner_request.get("toolConfig").is_some() {
-        inner_request["toolConfig"] = json!({
-            "functionCallingConfig": { "mode": "VALIDATED" }
-        });
+    if inner_request.get("tools").is_some() {
+        let tool_config = inner_request
+            .as_object_mut()
+            .unwrap()
+            .entry("toolConfig")
+            .or_insert_with(|| json!({}));
+
+        if let Some(obj) = tool_config.as_object_mut() {
+            if !obj.contains_key("functionCallingConfig") {
+                obj.insert(
+                    "functionCallingConfig".to_string(),
+                    json!({ "mode": "VALIDATED" }),
+                );
+            }
+        }
     }
 
     // [ADDED v4.1.24] 注入基于账号的稳定 sessionId
@@ -595,7 +707,7 @@ pub fn inject_ids_to_response(response: &mut Value, model_name: &str) {
                         if fc.get("id").is_none() {
                             let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
                             let count = name_counters.entry(name.to_string()).or_insert(0);
-                            let call_id = format!("call_{}_{}", name, count);
+                            let call_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, format!("{}_{}", name, count).as_bytes()).to_string();
                             *count += 1;
 
                             fc.insert("id".to_string(), json!(call_id));
@@ -889,9 +1001,9 @@ mod tests {
             let gen_config = req.get("generationConfig").expect("generationConfig should be present");
             let thinking_config = gen_config.get("thinkingConfig").expect("thinkingConfig should be injected");
 
-            // 3. 验证 Claude 默认预算为 16000
+            // 3. 验证默认预算为 24576
             let budget = thinking_config["thinkingBudget"].as_u64().expect("thinkingBudget should be a number");
-            assert_eq!(budget, 16000, "Claude default thinking budget should be 16000");
+            assert_eq!(budget, 24576, "Claude default thinking budget should be 24576");
         }
 
         #[test]

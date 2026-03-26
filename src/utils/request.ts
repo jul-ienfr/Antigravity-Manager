@@ -66,6 +66,8 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'execute_cli_sync': { url: '/api/proxy/cli/sync', method: 'POST' },
   'execute_cli_restore': { url: '/api/proxy/cli/restore', method: 'POST' },
   'get_cli_config_content': { url: '/api/proxy/cli/config', method: 'POST' },
+  'execute_claude_sync_advanced': { url: '/api/proxy/claude/sync', method: 'POST' },
+  'execute_claude_restore_advanced': { url: '/api/proxy/claude/restore', method: 'POST' },
 
   // OpenCode Sync
   'get_opencode_sync_status': { url: '/api/proxy/opencode/status', method: 'POST' },
@@ -115,6 +117,9 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'complete_oauth_login': { url: '/api/accounts/oauth/complete', method: 'POST' },
   'cancel_oauth_login': { url: '/api/accounts/oauth/cancel', method: 'POST' },
   'submit_oauth_code': { url: '/api/accounts/oauth/submit-code', method: 'POST' },
+  'list_oauth_clients': { url: '/api/accounts/oauth/clients', method: 'GET' },
+  'get_active_oauth_client': { url: '/api/accounts/oauth/client', method: 'GET' },
+  'set_active_oauth_client': { url: '/api/accounts/oauth/client', method: 'POST' },
 
   // Import
   'import_v1_accounts': { url: '/api/accounts/import/v1', method: 'POST' },
