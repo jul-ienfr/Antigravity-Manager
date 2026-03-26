@@ -129,8 +129,7 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
             .then((clients) => {
                 setOauthClients(clients);
                 if (clients.length > 0 && !selectedClient) {
-                    const active = clients.find(c => c.is_active);
-                    setSelectedClient(active?.key || clients[0].key);
+                    setSelectedClient(clients[0].key);
                 }
             })
             .catch(() => { /* not critical */ });
