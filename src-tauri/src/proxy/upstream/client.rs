@@ -117,10 +117,10 @@ impl UpstreamClient {
             .emulation(emul_enum)
             // Connection settings (优化连接复用，减少建立开销)
             .connect_timeout(Duration::from_secs(20))
-            .pool_max_idle_per_host(16) // 每主机最多 16 个空闲连接
+            .pool_max_idle_per_host(32) // [OPT #8] 每主机最多 32 个空闲连接（高并发场景）
             .pool_idle_timeout(Duration::from_secs(90)) // 空闲连接保持 90 秒
             .tcp_keepalive(Duration::from_secs(60)) // TCP 保活探测 60 秒
-            .timeout(Duration::from_secs(600));
+            .timeout(Duration::from_secs(180));  // [OPT #7] 180s max (was 600s - prevents zombie conns)
 
         builder = Self::apply_default_user_agent(builder);
 
@@ -154,10 +154,10 @@ impl UpstreamClient {
         let builder = Client::builder()
             .emulation(emul_enum)
             .connect_timeout(Duration::from_secs(20))
-            .pool_max_idle_per_host(16)
+            .pool_max_idle_per_host(32) // [OPT #8]
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(60))
-            .timeout(Duration::from_secs(600))
+            .timeout(Duration::from_secs(180))  // [OPT #7]
             .proxy(proxy_config.proxy); // Apply the specific proxy
 
         Self::apply_default_user_agent(builder).build()
@@ -194,26 +194,32 @@ impl UpstreamClient {
 
     /// Get client for a specific account (or default if no proxy bound)
     pub async fn get_client(&self, account_id: Option<&str>) -> Client {
+        self.get_client_and_geo(account_id).await.0
+    }
+
+    /// [OPT #4] Combined client + geolocation in a single get_proxy_for_account call.
+    /// Avoids the double proxy lookup that occurred when get_client() and get_geolocation_headers()
+    /// were called separately for every request.
+    pub async fn get_client_and_geo(&self, account_id: Option<&str>) -> (Client, Option<String>, Option<String>) {
         if let Some(pool) = &self.proxy_pool {
             if let Some(acc_id) = account_id {
-                // Try to get per-account proxy
                 match pool.get_proxy_for_account(acc_id).await {
                     Ok(Some(proxy_cfg)) => {
-                        // Check cache
+                        let tz = proxy_cfg.timezone.clone();
+                        let locale = proxy_cfg.locale.clone();
+                        // Check cache first
                         if let Some(client) = self.client_cache.get(&proxy_cfg.entry_id) {
-                            return client.clone();
+                            return (client.clone(), tz, locale);
                         }
                         // Build new client and cache it
                         match self.build_client_with_proxy(proxy_cfg.clone()) {
                             Ok(client) => {
-                                self.client_cache
-                                    .insert(proxy_cfg.entry_id.clone(), client.clone());
+                                self.client_cache.insert(proxy_cfg.entry_id.clone(), client.clone());
                                 tracing::info!(
                                     "Using ProxyPool proxy ID: {} for account: {}",
-                                    proxy_cfg.entry_id,
-                                    acc_id
+                                    proxy_cfg.entry_id, acc_id
                                 );
-                                return client;
+                                return (client, tz, locale);
                             }
                             Err(e) => {
                                 tracing::error!("Failed to build client for proxy {}: {}, falling back to isolated account client", proxy_cfg.entry_id, e);
@@ -226,26 +232,25 @@ impl UpstreamClient {
                     Err(e) => {
                         tracing::error!(
                             "Error getting proxy for account {}: {}, falling back to isolated account client",
-                            acc_id,
-                            e
+                            acc_id, e
                         );
                     }
                 }
             }
         }
-        
+
         // [STEALTH MODE] Fallback to generating an isolated, pure client per account
         if let Some(acc_id) = account_id {
             if let Some(client) = self.account_clients.get(acc_id) {
-                return client.clone();
+                return (client.clone(), None, None);
             }
-            
+
             // Rebuild client to create an isolated TCP/TLS session, carrying the base proxy config
             match Self::build_client_internal(self.base_proxy_config.clone()) {
                 Ok(client) => {
                     self.account_clients.insert(acc_id.to_string(), client.clone());
                     tracing::info!("[Stealth Mode] Created isolated TLS client for account: {}", acc_id);
-                    return client;
+                    return (client, None, None);
                 }
                 Err(e) => {
                     tracing::error!("Failed to build isolated client for account {}: {}", acc_id, e);
@@ -254,7 +259,7 @@ impl UpstreamClient {
         }
 
         // Fallback to default global client (e.g. for unauthenticated requests)
-        self.default_client.clone()
+        (self.default_client.clone(), None, None)
     }
 
     /// [NEW] Get detected Timezone and Locale from the assigned proxy in the pool
@@ -382,8 +387,8 @@ impl UpstreamClient {
         extra_headers: std::collections::HashMap<String, String>,
         account_id: Option<&str>, // [NEW] Account ID
     ) -> Result<UpstreamCallResult, String> {
-        // [NEW] Get client based on account (cached in proxy pool manager)
-        let client = self.get_client(account_id).await;
+        // [OPT #4] Get client + geolocation in a single proxy lookup instead of two separate calls
+        let (client, _tz_from_client, _locale_from_client) = self.get_client_and_geo(account_id).await;
 
         // 构建 Headers (所有端点复用)
         let mut headers = header::HeaderMap::new();
@@ -430,8 +435,8 @@ impl UpstreamClient {
             }
         }
 
-        // [NEW] Inject Auto-Detected Geolocation Headers for Stealth
-        let (tz, locale) = self.get_geolocation_headers(account_id).await;
+        // [OPT #4] Geolocation already resolved above via get_client_and_geo (single proxy lookup)
+        let (tz, locale) = (_tz_from_client, _locale_from_client);
         if let Some(t) = tz {
             if let Ok(hv) = header::HeaderValue::from_str(&t) {
                 // Not standard HTTP but widely used in modern APIs to resolve locale

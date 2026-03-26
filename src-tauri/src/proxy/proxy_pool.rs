@@ -50,6 +50,8 @@ pub struct ProxyPoolManager {
 
     /// [FIX] HTTP Client 缓存，用于复用连接池 (Keep-Alive)
     client_cache: Arc<DashMap<String, Client>>,
+    /// [OPT #9] Guard against concurrent health checks
+    is_health_checking: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ProxyPoolManager {
@@ -74,6 +76,7 @@ impl ProxyPoolManager {
             account_bindings,
             round_robin_index: Arc::new(AtomicUsize::new(0)),
             client_cache: Arc::new(DashMap::new()),
+            is_health_checking: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -90,9 +93,9 @@ impl ProxyPoolManager {
             let config = self.config.read().await;
             if config.enabled {
                 let res = self.select_proxy_from_pool(&config).await.ok().flatten();
-                if let Some(ref p) = res {
-                    tracing::info!("[Proxy] Route: Generic Request -> Proxy {} (Pool)", p.entry_id);
-                }
+        if let Some(ref p) = res {
+            tracing::debug!("[Proxy] Route: Generic Request -> Proxy {} (Pool)", p.entry_id);
+        }
                 res
             } else {
                 None
@@ -220,7 +223,7 @@ impl ProxyPoolManager {
         // 2. 否则从池中策略选择 (公用池)
         let res = self.select_proxy_from_pool(&config).await?;
         if let Some(ref p) = res {
-            tracing::info!("[Proxy] Route: Account {} -> Proxy {} (Pool)", account_id, p.entry_id);
+            tracing::debug!("[Proxy] Route: Account {} -> Proxy {} (Pool)", account_id, p.entry_id);
         }
         Ok(res)
     }
@@ -324,8 +327,23 @@ impl ProxyPoolManager {
     }
     
     fn select_weighted<'a>(&self, proxies: &[&'a ProxyEntry]) -> Option<&'a ProxyEntry> {
-        // 简单实现: 类似优先级的加权, 这里暂用 Priority 代替
-        self.select_by_priority(proxies)
+        // [OPT #6] True weighted random selection based on ProxyEntry::priority
+        // Lower priority number = higher weight (e.g. priority 1 has weight 100, priority 5 has weight 20)
+        if proxies.is_empty() { return None; }
+        use rand::Rng;
+        let max_prio = proxies.iter().map(|p| p.priority).max().unwrap_or(1).max(1);
+        let weights: Vec<u32> = proxies.iter().map(|p| {
+            let inverted = (max_prio + 1).saturating_sub(p.priority) as u32;
+            inverted.max(1)
+        }).collect();
+        let total: u32 = weights.iter().sum();
+        let mut rng = rand::thread_rng();
+        let mut pick = rng.gen_range(0..total);
+        for (i, w) in weights.iter().enumerate() {
+            if pick < *w { return Some(proxies[i]); }
+            pick -= w;
+        }
+        Some(proxies[proxies.len() - 1])
     }
 
     /// 构建 reqwest::Proxy 配置
@@ -592,11 +610,17 @@ impl ProxyPoolManager {
         tokio::spawn(async move {
             tracing::info!("Starting proxy pool health check loop...");
             loop {
-                // Perform check only if enabled
+                // Perform check only if enabled and no check already running [OPT #9]
                 let enabled = self.config.read().await.enabled;
                 if enabled {
-                    if let Err(e) = self.health_check().await {
-                        tracing::error!("Proxy pool health check failed: {}", e);
+                    // Skip if a health check is already in progress
+                    if !self.is_health_checking.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        if let Err(e) = self.health_check().await {
+                            tracing::error!("Proxy pool health check failed: {}", e);
+                        }
+                        self.is_health_checking.store(false, std::sync::atomic::Ordering::SeqCst);
+                    } else {
+                        tracing::debug!("[ProxyPool] Skipping health check — previous check still running");
                     }
                 }
 
@@ -606,7 +630,7 @@ impl ProxyPoolManager {
                     if !cfg.enabled {
                         60 // check every minute if disabled
                     } else {
-                        cfg.health_check_interval.max(30) // Back to default min 30s
+                        cfg.health_check_interval.max(30)
                     }
                 };
 

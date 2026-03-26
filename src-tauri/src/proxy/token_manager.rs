@@ -53,6 +53,10 @@ pub struct TokenManager {
     /// 支持优雅关闭时主动 abort 后台任务
     auto_cleanup_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     cancel_token: CancellationToken,
+    /// [OPT #1] Cache for on-disk account state to avoid re-reading JSON per reload (TTL: 5s)
+    disk_state_cache: Arc<DashMap<std::path::PathBuf, (OnDiskAccountState, std::time::Instant)>>,
+    /// [OPT #2] Cached quota protection config to avoid load_app_config() on every account reload
+    cached_quota_protection: Arc<tokio::sync::RwLock<Option<crate::models::QuotaProtectionConfig>>>,
 }
 
 impl TokenManager {
@@ -76,6 +80,8 @@ impl TokenManager {
             )),
             auto_cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
             cancel_token: CancellationToken::new(),
+            disk_state_cache: Arc::new(DashMap::new()),
+            cached_quota_protection: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -408,7 +414,8 @@ impl TokenManager {
         }
 
         // Safety check: verify state on disk again to handle concurrent mid-parse writes
-        if Self::get_account_state_on_disk(path).await == OnDiskAccountState::Disabled {
+        // [OPT #1] Use cached version (TTL 5s) to avoid re-reading file on every reload
+        if self.get_account_state_cached(path).await == OnDiskAccountState::Disabled {
             tracing::debug!("Account file {:?} is disabled on disk, skipping.", path);
             return Ok(None);
         }
@@ -562,6 +569,44 @@ impl TokenManager {
         }))
     }
 
+    /// [OPT #1] Cached version of get_account_state_on_disk with 5s TTL.
+    /// Invalidated automatically on expiry — no explicit invalidation needed.
+    async fn get_account_state_cached(&self, path: &std::path::PathBuf) -> OnDiskAccountState {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(5);
+        if let Some(entry) = self.disk_state_cache.get(path) {
+            let (state, ts) = entry.value();
+            if ts.elapsed() < TTL {
+                return *state;
+            }
+        }
+        let state = Self::get_account_state_on_disk(path).await;
+        self.disk_state_cache.insert(path.clone(), (state, std::time::Instant::now()));
+        state
+    }
+
+    /// [OPT #2] Returns cached quota protection config, loading from disk only on first call
+    /// or when cache is invalidated via invalidate_quota_protection_cache().
+    async fn get_cached_quota_protection(&self) -> Option<crate::models::QuotaProtectionConfig> {
+        {
+            let guard = self.cached_quota_protection.read().await;
+            if guard.is_some() {
+                return guard.clone();
+            }
+        }
+        // Cache miss — load from disk once
+        if let Ok(cfg) = crate::modules::config::load_app_config() {
+            let qp = cfg.quota_protection;
+            *self.cached_quota_protection.write().await = Some(qp.clone());
+            return Some(qp);
+        }
+        None
+    }
+
+    /// [OPT #2] Invalidate the quota protection config cache (call after config save).
+    pub async fn invalidate_quota_protection_cache(&self) {
+        *self.cached_quota_protection.write().await = None;
+    }
+
     /// 检查账号是否应该被配额保护
     /// 如果配额低于阈值，自动禁用账号并返回 true
     async fn check_and_protect_quota(
@@ -569,10 +614,10 @@ impl TokenManager {
         account_json: &mut serde_json::Value,
         account_path: &PathBuf,
     ) -> bool {
-        // 1. 加载配额保护配置
-        let config = match crate::modules::config::load_app_config() {
-            Ok(cfg) => cfg.quota_protection,
-            Err(_) => return false, // 配置加载失败，跳过保护
+        // 1. 加载配额保护配置 [OPT #2] 使用缓存而非硬盘每次读取
+        let config = match self.get_cached_quota_protection().await {
+            Some(cfg) => cfg,
+            None => return false, // 配置加载失败，跳过保护
         };
 
         if !config.enabled {
@@ -813,15 +858,16 @@ impl TokenManager {
             None => return mapped_model.to_string(),
         };
 
-        let account_path = match self.tokens.get(account_id) {
-            Some(token) => token.account_path.clone(),
+        // [OPT #3] Use in-memory model_quotas instead of reading from disk each request.
+        // model_quotas keys are standard IDs (normalize_to_standard_id), same as build_dynamic_model_candidates output.
+        let available_models: HashSet<String> = match self.tokens.get(account_id) {
+            Some(token) => token.model_quotas.keys().cloned().collect(),
             None => return mapped_model.to_string(),
         };
 
-        let available_models = match Self::get_available_models_from_json(&account_path) {
-            Some(models) if !models.is_empty() => models,
-            _ => return mapped_model.to_string(),
-        };
+        if available_models.is_empty() {
+            return mapped_model.to_string();
+        }
 
         for candidate in candidates {
             if available_models.contains(&candidate) {
@@ -839,6 +885,7 @@ impl TokenManager {
 
         mapped_model.to_string()
     }
+
 
     /// 测试辅助函数：公开访问 get_model_quota_from_json
     #[cfg(test)]
