@@ -607,6 +607,43 @@ impl TokenManager {
         *self.cached_quota_protection.write().await = None;
     }
 
+    /// [OPT B] Resolve RPM/TPM limits for a given subscription tier and predictive config.
+    /// Single source of truth — replaces the 50-line duplication in get_token_internal.
+    /// Returns (rpm_limit, tpm_limit).
+    fn resolve_tier_limits(
+        tier: Option<&str>,
+        cfg: &crate::proxy::config::PredictiveDistributionConfig,
+    ) -> (u64, u64) {
+        use crate::proxy::config::TierLimitMode;
+        let raw = tier.unwrap_or("FREE").to_uppercase();
+        let tier_key = if raw.contains("ULTRA") || raw.contains("PREMIUM") { "ULTRA" }
+                       else if raw.contains("PRO") { "PRO" }
+                       else { "FREE" };
+        match tier_key {
+            "PRO" => match cfg.pro_tier.mode {
+                TierLimitMode::Auto => (360, 4_000_000),
+                TierLimitMode::Manual => (
+                    if cfg.pro_tier.rpm_limit > 0 { cfg.pro_tier.rpm_limit as u64 } else { cfg.rpm_limit as u64 },
+                    if cfg.pro_tier.tpm_limit > 0 { cfg.pro_tier.tpm_limit as u64 } else { cfg.tpm_limit as u64 },
+                ),
+            },
+            "ULTRA" => match cfg.ultra_tier.mode {
+                TierLimitMode::Auto => (1000, 8_000_000),
+                TierLimitMode::Manual => (
+                    if cfg.ultra_tier.rpm_limit > 0 { cfg.ultra_tier.rpm_limit as u64 } else { cfg.rpm_limit as u64 },
+                    if cfg.ultra_tier.tpm_limit > 0 { cfg.ultra_tier.tpm_limit as u64 } else { cfg.tpm_limit as u64 },
+                ),
+            },
+            _ => match cfg.free_tier.mode {
+                TierLimitMode::Auto => (15, 1_000_000),
+                TierLimitMode::Manual => (
+                    if cfg.free_tier.rpm_limit > 0 { cfg.free_tier.rpm_limit as u64 } else { cfg.rpm_limit as u64 },
+                    if cfg.free_tier.tpm_limit > 0 { cfg.free_tier.tpm_limit as u64 } else { cfg.tpm_limit as u64 },
+                ),
+            },
+        }
+    }
+
     /// 检查账号是否应该被配额保护
     /// 如果配额低于阈值，自动禁用账号并返回 true
     async fn check_and_protect_quota(
@@ -1246,51 +1283,11 @@ impl TokenManager {
                 let rpm = tracker.get_account_rpm(&t.email);
                 let tpm = tracker.get_account_tpm(&t.email);
                 
-                let mut actual_rpm_limit = 14;
-                let mut actual_tpm_limit = 30000;
-                
-                use crate::proxy::config::TierLimitMode;
+                // [OPT B] Deduplicated — use shared resolve_tier_limits() helper
+                let (actual_rpm_limit, actual_tpm_limit) =
+                    Self::resolve_tier_limits(t.subscription_tier.as_deref(), &predictive_cfg);
 
-                let mut tier_upper = t.subscription_tier.as_deref().unwrap_or("FREE").to_uppercase();
-                    if tier_upper.contains("ULTRA") { tier_upper = "ULTRA".to_string(); }
-                    else if tier_upper.contains("PRO") { tier_upper = "PRO".to_string(); }
-                
-                if tier_upper == "PRO" {
-                    match predictive_cfg.pro_tier.mode {
-                        TierLimitMode::Auto => {
-                            actual_rpm_limit = 360;
-                            actual_tpm_limit = 4_000_000;
-                        }
-                        TierLimitMode::Manual => {
-                            actual_rpm_limit = if predictive_cfg.pro_tier.rpm_limit > 0 { predictive_cfg.pro_tier.rpm_limit } else { predictive_cfg.rpm_limit };
-                            actual_tpm_limit = if predictive_cfg.pro_tier.tpm_limit > 0 { predictive_cfg.pro_tier.tpm_limit } else { predictive_cfg.tpm_limit };
-                        }
-                    }
-                } else if tier_upper == "ULTRA" || tier_upper == "PREMIUM" {
-                    match predictive_cfg.ultra_tier.mode {
-                        TierLimitMode::Auto => {
-                            actual_rpm_limit = 1000;
-                            actual_tpm_limit = 8_000_000;
-                        }
-                        TierLimitMode::Manual => {
-                            actual_rpm_limit = if predictive_cfg.ultra_tier.rpm_limit > 0 { predictive_cfg.ultra_tier.rpm_limit } else { predictive_cfg.rpm_limit };
-                            actual_tpm_limit = if predictive_cfg.ultra_tier.tpm_limit > 0 { predictive_cfg.ultra_tier.tpm_limit } else { predictive_cfg.tpm_limit };
-                        }
-                    }
-                } else {
-                    match predictive_cfg.free_tier.mode {
-                        TierLimitMode::Auto => {
-                            actual_rpm_limit = 15;
-                            actual_tpm_limit = 1_000_000;
-                        }
-                        TierLimitMode::Manual => {
-                            actual_rpm_limit = if predictive_cfg.free_tier.rpm_limit > 0 { predictive_cfg.free_tier.rpm_limit } else { predictive_cfg.rpm_limit };
-                            actual_tpm_limit = if predictive_cfg.free_tier.tpm_limit > 0 { predictive_cfg.free_tier.tpm_limit } else { predictive_cfg.tpm_limit };
-                        }
-                    }
-                }
-
-                if rpm < actual_rpm_limit && tpm < actual_tpm_limit {
+                if (rpm as u64) < actual_rpm_limit && (tpm as u64) < actual_tpm_limit {
                     available_count += 1;
                 }
             }
@@ -1312,50 +1309,11 @@ impl TokenManager {
                 tokens_snapshot.retain(|t| {
                     let rpm = tracker.get_account_rpm(&t.email);
                     let tpm = tracker.get_account_tpm(&t.email);
-                    
-                    let mut actual_rpm_limit = 14;
-                    let mut actual_tpm_limit = 30000;
-                    
-                    let mut tier_upper = t.subscription_tier.as_deref().unwrap_or("FREE").to_uppercase();
-                    if tier_upper.contains("ULTRA") { tier_upper = "ULTRA".to_string(); }
-                    else if tier_upper.contains("PRO") { tier_upper = "PRO".to_string(); }
-                    
-                    if tier_upper == "PRO" {
-                        match predictive_cfg.pro_tier.mode {
-                            crate::proxy::config::TierLimitMode::Auto => {
-                                actual_rpm_limit = 360;
-                                actual_tpm_limit = 4_000_000;
-                            }
-                            crate::proxy::config::TierLimitMode::Manual => {
-                                actual_rpm_limit = if predictive_cfg.pro_tier.rpm_limit > 0 { predictive_cfg.pro_tier.rpm_limit } else { predictive_cfg.rpm_limit };
-                                actual_tpm_limit = if predictive_cfg.pro_tier.tpm_limit > 0 { predictive_cfg.pro_tier.tpm_limit } else { predictive_cfg.tpm_limit };
-                            }
-                        }
-                    } else if tier_upper == "ULTRA" || tier_upper == "PREMIUM" {
-                        match predictive_cfg.ultra_tier.mode {
-                            crate::proxy::config::TierLimitMode::Auto => {
-                                actual_rpm_limit = 1000;
-                                actual_tpm_limit = 8_000_000;
-                            }
-                            crate::proxy::config::TierLimitMode::Manual => {
-                                actual_rpm_limit = if predictive_cfg.ultra_tier.rpm_limit > 0 { predictive_cfg.ultra_tier.rpm_limit } else { predictive_cfg.rpm_limit };
-                                actual_tpm_limit = if predictive_cfg.ultra_tier.tpm_limit > 0 { predictive_cfg.ultra_tier.tpm_limit } else { predictive_cfg.tpm_limit };
-                            }
-                        }
-                    } else {
-                        match predictive_cfg.free_tier.mode {
-                            crate::proxy::config::TierLimitMode::Auto => {
-                                actual_rpm_limit = 15;
-                                actual_tpm_limit = 1_000_000;
-                            }
-                            crate::proxy::config::TierLimitMode::Manual => {
-                                actual_rpm_limit = if predictive_cfg.free_tier.rpm_limit > 0 { predictive_cfg.free_tier.rpm_limit } else { predictive_cfg.rpm_limit };
-                                actual_tpm_limit = if predictive_cfg.free_tier.tpm_limit > 0 { predictive_cfg.free_tier.tpm_limit } else { predictive_cfg.tpm_limit };
-                            }
-                        }
-                    }
+                    // [OPT B] Deduplicated — use shared resolve_tier_limits() helper
+                    let (actual_rpm_limit, actual_tpm_limit) =
+                        Self::resolve_tier_limits(t.subscription_tier.as_deref(), &predictive_cfg);
 
-                    rpm < actual_rpm_limit && tpm < actual_tpm_limit
+                    (rpm as u64) < actual_rpm_limit && (tpm as u64) < actual_tpm_limit
                 });
             }
         }
@@ -1475,9 +1433,9 @@ impl TokenManager {
         use crate::proxy::sticky_config::SchedulingMode;
 
         // 【新增】检查配额保护是否启用（如果关闭，则忽略 protected_models 检查）
-        let quota_protection_enabled = crate::modules::config::load_app_config()
-            .map(|cfg| cfg.quota_protection.enabled)
-            .unwrap_or(false);
+        // [OPT A] Use cached quota protection config (no disk read per request)
+        let quota_protection_enabled = self.get_cached_quota_protection().await
+            .map(|cfg| cfg.enabled).unwrap_or(false);
 
         // ===== [FIX #820] 固定账号模式：优先使用指定账号 =====
         let preferred_id = self.preferred_account_id.read().await.clone();
@@ -1489,7 +1447,8 @@ impl TokenManager {
                 .cloned()
             {
                 // 检查账号是否可用（未限流、未被配额保护）
-                match Self::get_account_state_on_disk(&preferred_token.account_path).await {
+                    // [OPT D] Use cached disk state to avoid per-request disk read
+                    match self.get_account_state_cached(&preferred_token.account_path).await {
                     OnDiskAccountState::Disabled => {
                         tracing::warn!(
                             "🔒 [FIX #820] Preferred account {} is disabled on disk, purging and falling back",
@@ -1523,11 +1482,7 @@ impl TokenManager {
                         }
                     }
                     OnDiskAccountState::Enabled => {
-                        let normalized_target =
-                            crate::proxy::common::model_mapping::normalize_to_standard_id(
-                                target_model,
-                            )
-                            .unwrap_or_else(|| target_model.to_string());
+                        // [OPT E] Reuse normalized_target computed at top of get_token_internal
 
                 let is_rate_limited = self
                     .is_rate_limited(&preferred_token.account_id, Some(&normalized_target))
@@ -1633,8 +1588,8 @@ impl TokenManager {
             let mut target_token: Option<ProxyToken> = None;
 
             // 归一化目标模型名为标准 ID，用于配额保护检查
-            let normalized_target = crate::proxy::common::model_mapping::normalize_to_standard_id(target_model)
-                .unwrap_or_else(|| target_model.to_string());
+            // [OPT E] Reuse normalized_target computed once at top of get_token_internal
+            // (removed redundant let binding)
 
             // 模式 A: 粘性会话处理 (CacheFirst 或 Balance 且有 session_id)
             if !rotate
@@ -3164,8 +3119,8 @@ mod tests {
             let t = tier.as_deref().unwrap_or("").to_lowercase();
             if t.contains("ultra") { 0 }
             else if t.contains("pro") { 1 }
-            else if t.contains("free") { 2 }
-            else { 3 }
+            // [FIX C] Accounts with absent/unknown tier treated same as FREE (was: 3 → deprioritized below FREE)
+            else { 2 }
         };
 
         // First: compare by subscription tier

@@ -102,38 +102,53 @@ pub async fn handle_generate(
     
     let mut accumulated_queue_duration: u64 = 0;
 
-    for attempt in 0..max_attempts {
-        // 3. 模型路由解析
-        let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
-            &model_name,
-            &*state.custom_mapping.read().await,
-        );
-        // 提取 tools 列表以进行联网探测 (Gemini 风格可能是嵌套的)
-        let tools_val: Option<Vec<Value>> =
-            body.get("tools").and_then(|t| t.as_array()).map(|arr| {
-                let mut flattened = Vec::new();
-                for tool_entry in arr {
-                    if let Some(decls) = tool_entry
-                        .get("functionDeclarations")
-                        .and_then(|v| v.as_array())
-                    {
-                        flattened.extend(decls.iter().cloned());
-                    } else {
-                        flattened.push(tool_entry.clone());
-                    }
+    // [OPT H] Pre-compute values constant across all retry attempts
+    let mapped_model_base = crate::proxy::common::model_mapping::resolve_model_route(
+        &model_name,
+        &*state.custom_mapping.read().await,
+    );
+    let tools_val: Option<Vec<Value>> =
+        body.get("tools").and_then(|t| t.as_array()).map(|arr| {
+            let mut flattened = Vec::new();
+            for tool_entry in arr {
+                if let Some(decls) = tool_entry
+                    .get("functionDeclarations")
+                    .and_then(|v| v.as_array())
+                {
+                    flattened.extend(decls.iter().cloned());
+                } else {
+                    flattened.push(tool_entry.clone());
                 }
-                flattened
-            });
+            }
+            flattened
+        });
+    let base_config = crate::proxy::mappers::common_utils::resolve_request_config(
+        &model_name,
+        &mapped_model_base,
+        &tools_val,
+        None,
+        None,
+        None,
+        Some(&body),
+    );
+    // Build Claude extra_headers once — resolve_dynamic_model won't affect Claude models
+    let extra_headers_base: std::collections::HashMap<String, String> = {
+        let mut m = std::collections::HashMap::new();
+        if mapped_model_base.to_lowercase().contains("claude") {
+            let client_beta = headers.get("anthropic-beta").and_then(|v| v.to_str().ok());
+            let combined = format!("{},interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14", client_beta.unwrap_or(""));
+            let sanitized = crate::proxy::common::utils::sanitize_anthropic_beta(Some(&combined));
+            m.insert("anthropic-beta".to_string(), sanitized);
+            tracing::debug!("[Gemini] Pre-computed Anthropic beta headers for Claude model: {}", mapped_model_base);
+        }
+        m
+    };
 
-        let config = crate::proxy::mappers::common_utils::resolve_request_config(
-            &model_name,
-            &mapped_model,
-            &tools_val,
-            None,        // size (not applicable for Gemini native protocol)
-            None,        // quality
-            None,        // [NEW] image_size
-            Some(&body), // [NEW] Pass request body for imageConfig parsing
-        );
+    for attempt in 0..max_attempts {
+        // [OPT H] Reuse pre-computed mapped_model and config
+        let mut mapped_model = mapped_model_base.clone();
+        let config = base_config.clone();
+
 
         // 4. 获取 Token (使用准确的 request_type)
         // 提取 SessionId (粘性指纹)
@@ -203,18 +218,8 @@ pub async fn handle_generate(
             "generateContent"
         };
 
-        // [FIX #1522] Inject Anthropic Beta Headers for Claude models
-        let mut extra_headers = std::collections::HashMap::new();
-        if mapped_model.to_lowercase().contains("claude") {
-            let client_beta = headers.get("anthropic-beta").and_then(|v| v.to_str().ok());
-            let combined = format!("{},interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14", client_beta.unwrap_or(""));
-            let sanitized = crate::proxy::common::utils::sanitize_anthropic_beta(Some(&combined));
-            extra_headers.insert("anthropic-beta".to_string(), sanitized);
-            tracing::debug!(
-                "[Gemini] Injected Anthropic beta headers for Claude model: {}",
-                mapped_model
-            );
-        }
+        // [OPT H] Reuse pre-computed Claude headers (computed once before retry loop)
+        let extra_headers = extra_headers_base.clone();
 
         let call_result = match upstream
             .call_v1_internal_with_headers(
